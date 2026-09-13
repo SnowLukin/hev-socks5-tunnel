@@ -16,18 +16,27 @@
 #include <sys/uio.h>
 #include <sys/stat.h>
 
+#include "hev-socks5-log-history-internal.h"
+
 #include "hev-logger.h"
 
 static int fd = -1;
+static int history_writer;
 static HevLoggerLevel req_level;
 
 int
 hev_logger_init (HevLoggerLevel level, const char *path)
 {
+    req_level = level;
+    history_writer = hev_socks5_log_history_enabled ();
+
+    if (history_writer) {
+        hev_socks5_log_history_acquire ();
+        return 0;
+    }
+
     if (!path)
         return 0;
-
-    req_level = level;
 
     if (0 == strcmp (path, "stdout"))
         fd = dup (1);
@@ -45,14 +54,19 @@ hev_logger_init (HevLoggerLevel level, const char *path)
 void
 hev_logger_fini (void)
 {
-    if (fd >= 0)
+    if (history_writer)
+        hev_socks5_log_history_release ();
+    else if (fd >= 0)
         close (fd);
+    fd = -1;
+    history_writer = 0;
 }
 
 int
 hev_logger_enabled (HevLoggerLevel level)
 {
-    if (level >= req_level && fd >= 0)
+    if (level >= req_level &&
+        ((history_writer && hev_socks5_log_history_active ()) || fd >= 0))
         return 1;
 
     return 0;
@@ -70,7 +84,7 @@ hev_logger_log (HevLoggerLevel level, const char *fmt, ...)
     va_list ap;
     int len;
 
-    if (level < req_level || fd < 0)
+    if (level < req_level || (!history_writer && fd < 0))
         return;
 
     time (&now);
@@ -104,10 +118,20 @@ hev_logger_log (HevLoggerLevel level, const char *fmt, ...)
 
     va_start (ap, fmt);
     iov[2].iov_base = msg;
-    iov[2].iov_len = vsnprintf (msg, sizeof (msg), fmt, ap);
-    if (iov[2].iov_len >= sizeof (msg))
-        iov[2].iov_len = sizeof (msg) - 1;
+    len = vsnprintf (msg, sizeof (msg), fmt, ap);
     va_end (ap);
+
+    if (len < 0)
+        return;
+    if (len >= (int)sizeof (msg))
+        len = sizeof (msg) - 1;
+    iov[2].iov_len = len;
+
+    if (history_writer) {
+        static const char *history_levels[] = { "debug", "info", "warning", "error", "unknown" };
+        hev_socks5_log_history_write (history_levels[level], msg);
+        return;
+    }
 
     iov[3].iov_base = "\n";
     iov[3].iov_len = 1;
