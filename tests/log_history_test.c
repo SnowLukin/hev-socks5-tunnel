@@ -119,6 +119,52 @@ parts_contain (const char *directory, const char *needle)
     return 0;
 }
 
+static int
+parts_have_complete_utf8_before_marker (const char *directory)
+{
+    struct dirent *entry;
+    char path[1024];
+    char content[4096];
+    const char *message;
+    const char *marker;
+    DIR *dir;
+
+    dir = opendir (directory);
+    if (!dir)
+        fail ("opendir");
+
+    while ((entry = readdir (dir))) {
+        int fd;
+        ssize_t length;
+
+        if (0 != strncmp (entry->d_name, "tun2socks.", 10) ||
+            !strstr (entry->d_name, ".jsonl"))
+            continue;
+        snprintf (path, sizeof (path), "%s/%s", directory, entry->d_name);
+        fd = open (path, O_RDONLY);
+        if (fd < 0)
+            fail ("open part");
+        length = read (fd, content, sizeof (content) - 1);
+        close (fd);
+        if (length < 0)
+            fail ("read part");
+        content[length] = '\0';
+        message = strstr (content, "\"message\":\"");
+        marker = strstr (content, " [truncated]");
+        if (message && marker) {
+            message += strlen ("\"message\":\"");
+            if ((marker - message) % 2 == 0 &&
+                (unsigned char)marker[-2] == 0xd0 &&
+                (unsigned char)marker[-1] == 0x96) {
+                closedir (dir);
+                return 1;
+            }
+        }
+    }
+    closedir (dir);
+    return 0;
+}
+
 static void
 path_for_part (char *path, size_t length, const char *directory, unsigned int number)
 {
@@ -198,8 +244,8 @@ test_rotation_and_shared_owner (const char *directory)
     expect (count_parts (directory) <= 4, "keep at most four parts");
     expect (part_bytes (directory) <= SOURCE_BYTES, "keep source budget");
     expect (count_parts (directory) > 1, "rotate across several parts");
-    expect (parts_contain (directory, "\"kind\":\"rotation\""),
-            "write a rotation record");
+    expect (!parts_contain (directory, "\"kind\":\"rotation\""),
+            "keep segments for log records");
 
     expect (newest_part (active_path, sizeof (active_path), directory),
             "active part after rotations");
@@ -406,6 +452,94 @@ test_retention_uses_part_ordinal (const char *directory)
 }
 
 static void
+test_rotation_preserves_fitting_record (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 512, 2048, 4 };
+    char active_path[1024];
+    char *message;
+    struct stat before;
+    size_t length;
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure fitting rotation");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize fitting rotation");
+    hev_logger_log (HEV_LOGGER_INFO, "seed");
+    expect (newest_part (active_path, sizeof (active_path), directory),
+            "find seed part");
+    expect (stat (active_path, &before) == 0, "stat seed record");
+    expect (before.st_size < 512, "seed leaves room for fitting record");
+
+    length = 512 - (size_t)before.st_size + strlen ("seed");
+    message = malloc (length + 1);
+    if (!message)
+        fail ("allocate fitting record");
+    memset (message, 'r', length);
+    message[length] = '\0';
+
+    hev_logger_log (HEV_LOGGER_INFO, "%s", message);
+    expect (parts_contain (directory, message),
+            "preserve fitting record after rotation");
+    expect (part_bytes (directory) <= 2048, "keep fitting rotation source budget");
+    free (message);
+    hev_logger_fini ();
+}
+
+#if defined(__APPLE__)
+static void
+test_failed_rotation_cleanup_keeps_part_count (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 512, 2048, 1 };
+    char active_path[1024];
+    char state[4096];
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure cleanup failure");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize cleanup failure");
+    hev_logger_log (HEV_LOGGER_INFO, "%0350d", 0);
+    expect (newest_part (active_path, sizeof (active_path), directory),
+            "find immutable old part");
+    expect (chflags (active_path, UF_IMMUTABLE) == 0, "make old part immutable");
+    hev_logger_log (HEV_LOGGER_INFO, "%0350d", 1);
+    expect (count_parts (directory) == 1, "remove empty part after cleanup failure");
+    expect (part_bytes (directory) <= 512, "do not exceed source budget after cleanup failure");
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read cleanup failure state");
+    expect (strstr (state, "\"errorCode\":\"cleanup-failed\"") != NULL,
+            "report cleanup failure");
+    expect (chflags (active_path, 0) == 0, "clear immutable old part");
+    hev_logger_fini ();
+}
+#endif
+
+static void
+test_long_formatted_messages_have_marker (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 2048, 8192, 4 };
+    char message[1201];
+    size_t index;
+
+    for (index = 0; index < sizeof (message) - 1; index += 2) {
+        message[index] = (char)0xd0;
+        message[index + 1] = (char)0x96;
+    }
+    message[sizeof (message) - 1] = '\0';
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure truncated messages");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize root truncated message");
+    expect (0 == hev_socks5_logger_init (HEV_SOCKS5_LOGGER_DEBUG, "stdout"),
+            "initialize core truncated message");
+    hev_logger_log (HEV_LOGGER_INFO, "%s", message);
+    hev_socks5_logger_log (HEV_SOCKS5_LOGGER_INFO, "%s", message);
+    expect (parts_have_complete_utf8_before_marker (directory),
+            "preserve UTF-8 before truncation marker");
+    hev_socks5_logger_fini ();
+    hev_logger_fini ();
+}
+
+static void
 test_restart_does_not_report_persisted_active_state (const char *directory)
 {
     char path[1024];
@@ -492,6 +626,11 @@ main (void)
     char legacy_template[] = "/tmp/hev-log-history-legacy.XXXXXX";
     char policy_template[] = "/tmp/hev-log-history-policy.XXXXXX";
     char retention_template[] = "/tmp/hev-log-history-retention.XXXXXX";
+    char fitting_template[] = "/tmp/hev-log-history-fitting.XXXXXX";
+#if defined(__APPLE__)
+    char cleanup_template[] = "/tmp/hev-log-history-cleanup.XXXXXX";
+#endif
+    char truncation_template[] = "/tmp/hev-log-history-truncation.XXXXXX";
     char restart_template[] = "/tmp/hev-log-history-restart.XXXXXX";
     char metadata_template[] = "/tmp/hev-log-history-metadata.XXXXXX";
     char disable_template[] = "/tmp/hev-log-history-disable.XXXXXX";
@@ -526,6 +665,23 @@ main (void)
     if (!directory)
         fail ("mkdtemp");
     test_retention_uses_part_ordinal (directory);
+
+    directory = mkdtemp (fitting_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_rotation_preserves_fitting_record (directory);
+
+#if defined(__APPLE__)
+    directory = mkdtemp (cleanup_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_failed_rotation_cleanup_keeps_part_count (directory);
+#endif
+
+    directory = mkdtemp (truncation_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_long_formatted_messages_have_marker (directory);
 
     directory = mkdtemp (restart_template);
     if (!directory)
