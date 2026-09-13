@@ -76,9 +76,17 @@ ifeq ($(V),1)
 	undefine ECHO_PREFIX
 endif
 
-.PHONY: exec static shared clean install uninstall tp-static tp-shared tp-clean
+.PHONY: exec static shared clean install uninstall tp-static tp-shared tp-clean test-log-history
 
 exec : $(EXEC_TARGET)
+
+test-log-history:
+	@tmp=$$(mktemp /tmp/hev-log-history.XXXXXX); \
+	$(CC) -std=c11 -D_DARWIN_C_SOURCE -Wall -Werror -pthread \
+		-Isrc -Isrc/misc -Isrc/core/include -Isrc/core/src \
+		tests/log_history_test.c src/misc/hev-logger.c \
+		src/core/src/hev-socks5-logger.c src/core/src/hev-socks5-log-history.c \
+		-o $$tmp && $$tmp; result=$$?; rm -f $$tmp; exit $$result
 
 static : $(STATIC_TARGET)
 

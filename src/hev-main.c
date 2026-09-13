@@ -53,8 +53,10 @@ hev_socks5_tunnel_main_inner (int tun_fd)
         return -2;
 
     res = hev_socks5_logger_init (log_level, log_file);
-    if (res < 0)
+    if (res < 0) {
+        hev_logger_fini ();
         return -3;
+    }
 
     nofile = hev_config_get_misc_limit_nofile ();
     res = set_limit_nofile (nofile);
