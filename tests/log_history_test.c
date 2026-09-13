@@ -180,6 +180,17 @@ part_exists (const char *directory, unsigned int number)
     return access (path, F_OK) == 0;
 }
 
+static void
+write_file (const char *path, const char *content)
+{
+    int fd = open (path, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    size_t length = strlen (content);
+
+    if (fd < 0 || write (fd, content, length) != (ssize_t)length)
+        fail ("write file");
+    close (fd);
+}
+
 static int
 newest_part (char *path, size_t length, const char *directory)
 {
@@ -418,6 +429,97 @@ test_disabled_keeps_legacy_file_route (const char *directory)
 }
 
 static void
+test_legacy_cleanup_keeps_current_log (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 512, 2048, 4 };
+    char path[1024];
+    int index;
+
+    snprintf (path, sizeof (path), "%s/tun2socks.log", directory);
+    write_file (path, "current legacy\n");
+    snprintf (path, sizeof (path), "%s/tun2socks.log.old", directory);
+    write_file (path, "old legacy\n");
+    for (index = 1; index <= 3; index++) {
+        path_for_part (path, sizeof (path), directory, (unsigned int)index);
+        write_file (path, "{}\n");
+    }
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure legacy cleanup");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize legacy cleanup");
+    snprintf (path, sizeof (path), "%s/tun2socks.log", directory);
+    expect (access (path, F_OK) == 0, "keep current legacy log");
+    snprintf (path, sizeof (path), "%s/tun2socks.log.old", directory);
+    expect (access (path, F_OK) != 0, "evict old legacy log first");
+    hev_logger_fini ();
+}
+
+static void
+test_state_write_failure_reports_failed (const char *directory)
+{
+    char path[1024];
+    char state[4096];
+
+    snprintf (path, sizeof (path), "%s/.tun2socks.state.%ld", directory, (long)getpid ());
+    expect (mkdir (path, 0700) == 0, "create state temp directory");
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, NULL),
+            "configure state temp failure");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize state temp failure");
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read state temp failure");
+    expect (strstr (state, "\"status\":\"failed\"") != NULL,
+            "state temp failure is not active");
+    expect (strstr (state, "\"errorCode\":\"state-write-failed\"") != NULL,
+            "report state temp failure");
+    hev_logger_fini ();
+}
+
+static void
+test_state_rename_failure_reports_failed (const char *directory)
+{
+    char path[1024];
+    char state[4096];
+
+    snprintf (path, sizeof (path), "%s/tun2socks.state.json", directory);
+    expect (mkdir (path, 0700) == 0, "create state destination directory");
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, NULL),
+            "configure state rename failure");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize state rename failure");
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read state rename failure");
+    expect (strstr (state, "\"status\":\"failed\"") != NULL,
+            "state rename failure is not active");
+    expect (strstr (state, "\"errorCode\":\"state-write-failed\"") != NULL,
+            "report state rename failure");
+    hev_logger_fini ();
+}
+
+static void
+test_state_close_failure_reports_failed (const char *directory)
+{
+    char path[1024];
+    char state[4096];
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, NULL),
+            "configure state close failure");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize state close failure");
+    snprintf (path, sizeof (path), "%s/tun2socks.state.json", directory);
+    expect (unlink (path) == 0, "remove active state file");
+    expect (mkdir (path, 0700) == 0, "block closed state rename");
+    hev_logger_fini ();
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read state close failure");
+    expect (strstr (state, "\"status\":\"failed\"") != NULL,
+            "state close failure is not closed");
+    expect (strstr (state, "\"errorCode\":\"state-write-failed\"") != NULL,
+            "report state close failure");
+}
+
+static void
 test_retention_uses_part_ordinal (const char *directory)
 {
     HevSocks5LogHistoryPolicy policy = { 512, 2048, 4 };
@@ -487,6 +589,36 @@ test_rotation_preserves_fitting_record (const char *directory)
 
 #if defined(__APPLE__)
 static void
+test_startup_cleanup_failure_discards_empty_part (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 512, 2048, 4 };
+    char path[1024];
+    char state[4096];
+    int index;
+
+    for (index = 1; index <= 3; index++) {
+        path_for_part (path, sizeof (path), directory, (unsigned int)index);
+        write_file (path, "{}\n");
+    }
+    path_for_part (path, sizeof (path), directory, 4);
+    write_file (path, "incomplete");
+    path_for_part (path, sizeof (path), directory, 1);
+    expect (chflags (path, UF_IMMUTABLE) == 0, "make oldest startup part immutable");
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure startup cleanup failure");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize startup cleanup failure");
+    expect (count_parts (directory) <= 4, "discard empty startup part after cleanup failure");
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read startup cleanup failure state");
+    expect (strstr (state, "\"status\":\"failed\"") != NULL,
+            "startup cleanup failure is failed");
+    expect (chflags (path, 0) == 0, "clear immutable startup part");
+    hev_logger_fini ();
+}
+
+static void
 test_failed_rotation_cleanup_keeps_part_count (const char *directory)
 {
     HevSocks5LogHistoryPolicy policy = { 512, 2048, 1 };
@@ -508,6 +640,12 @@ test_failed_rotation_cleanup_keeps_part_count (const char *directory)
             "read cleanup failure state");
     expect (strstr (state, "\"errorCode\":\"cleanup-failed\"") != NULL,
             "report cleanup failure");
+    expect (0 == hev_socks5_tunnel_log_history_configure (NULL, NULL, &policy),
+            "disable failed history");
+    expect (0 == hev_socks5_tunnel_log_history_state (state, sizeof (state)),
+            "read failed state after disable");
+    expect (strstr (state, "\"status\":\"failed\"") != NULL,
+            "disable preserves failed state");
     expect (chflags (active_path, 0) == 0, "clear immutable old part");
     hev_logger_fini ();
 }
@@ -624,11 +762,16 @@ main (void)
     char crash_template[] = "/tmp/hev-log-history-crash.XXXXXX";
     char error_template[] = "/tmp/hev-log-history-error.XXXXXX";
     char legacy_template[] = "/tmp/hev-log-history-legacy.XXXXXX";
+    char legacy_cleanup_template[] = "/tmp/hev-log-history-legacy-cleanup.XXXXXX";
+    char state_temp_template[] = "/tmp/hev-log-history-state-temp.XXXXXX";
+    char state_rename_template[] = "/tmp/hev-log-history-state-rename.XXXXXX";
+    char state_close_template[] = "/tmp/hev-log-history-state-close.XXXXXX";
     char policy_template[] = "/tmp/hev-log-history-policy.XXXXXX";
     char retention_template[] = "/tmp/hev-log-history-retention.XXXXXX";
     char fitting_template[] = "/tmp/hev-log-history-fitting.XXXXXX";
 #if defined(__APPLE__)
     char cleanup_template[] = "/tmp/hev-log-history-cleanup.XXXXXX";
+    char startup_cleanup_template[] = "/tmp/hev-log-history-startup-cleanup.XXXXXX";
 #endif
     char truncation_template[] = "/tmp/hev-log-history-truncation.XXXXXX";
     char restart_template[] = "/tmp/hev-log-history-restart.XXXXXX";
@@ -656,6 +799,26 @@ main (void)
         fail ("mkdtemp");
     test_disabled_keeps_legacy_file_route (directory);
 
+    directory = mkdtemp (legacy_cleanup_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_legacy_cleanup_keeps_current_log (directory);
+
+    directory = mkdtemp (state_temp_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_state_write_failure_reports_failed (directory);
+
+    directory = mkdtemp (state_rename_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_state_rename_failure_reports_failed (directory);
+
+    directory = mkdtemp (state_close_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_state_close_failure_reports_failed (directory);
+
     directory = mkdtemp (policy_template);
     if (!directory)
         fail ("mkdtemp");
@@ -672,6 +835,11 @@ main (void)
     test_rotation_preserves_fitting_record (directory);
 
 #if defined(__APPLE__)
+    directory = mkdtemp (startup_cleanup_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_startup_cleanup_failure_discards_empty_part (directory);
+
     directory = mkdtemp (cleanup_template);
     if (!directory)
         fail ("mkdtemp");
