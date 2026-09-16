@@ -165,6 +165,186 @@ parts_have_complete_utf8_before_marker (const char *directory)
     return 0;
 }
 
+static int
+utf8_valid (const unsigned char *data, size_t length)
+{
+    size_t index = 0;
+
+    while (index < length) {
+        unsigned char first = data[index++];
+        unsigned char second;
+
+        if (first < 0x80)
+            continue;
+        if (first >= 0xc2 && first <= 0xdf) {
+            if (index >= length || (data[index++] & 0xc0) != 0x80)
+                return 0;
+            continue;
+        }
+        if (first >= 0xe0 && first <= 0xef) {
+            if (index + 1 >= length)
+                return 0;
+            second = data[index++];
+            if ((second & 0xc0) != 0x80 ||
+                (first == 0xe0 && second < 0xa0) ||
+                (first == 0xed && second > 0x9f) ||
+                (data[index++] & 0xc0) != 0x80)
+                return 0;
+            continue;
+        }
+        if (first >= 0xf0 && first <= 0xf4) {
+            if (index + 2 >= length)
+                return 0;
+            second = data[index++];
+            if ((second & 0xc0) != 0x80 ||
+                (first == 0xf0 && second < 0x90) ||
+                (first == 0xf4 && second > 0x8f) ||
+                (data[index++] & 0xc0) != 0x80 ||
+                (data[index++] & 0xc0) != 0x80)
+                return 0;
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static const unsigned char *
+skip_json_space (const unsigned char *cursor, const unsigned char *end)
+{
+    while (cursor < end && (*cursor == ' ' || *cursor == '\t' ||
+                            *cursor == '\r' || *cursor == '\n'))
+        cursor++;
+    return cursor;
+}
+
+static int
+json_string_end (const unsigned char **cursor, const unsigned char *end)
+{
+    const unsigned char *value = *cursor;
+
+    if (value >= end || *value++ != '"')
+        return 0;
+    while (value < end) {
+        if (*value == '"') {
+            *cursor = value + 1;
+            return 1;
+        }
+        if (*value == '\\') {
+            value++;
+            if (value >= end)
+                return 0;
+            if (*value == 'u') {
+                int index;
+
+                for (index = 0; index < 4; index++) {
+                    value++;
+                    if (value >= end || !((*value >= '0' && *value <= '9') ||
+                                          (*value >= 'a' && *value <= 'f') ||
+                                          (*value >= 'A' && *value <= 'F')))
+                        return 0;
+                }
+            } else if (!strchr ("\"\\/bfnrt", *value)) {
+                return 0;
+            }
+        } else if (*value < 0x20) {
+            return 0;
+        }
+        value++;
+    }
+    return 0;
+}
+
+static int
+json_record_is_valid (const unsigned char *record, size_t length)
+{
+    const unsigned char *cursor = record;
+    const unsigned char *end = record + length;
+
+    if (!utf8_valid (record, length))
+        return 0;
+    cursor = skip_json_space (cursor, end);
+    if (cursor >= end || *cursor++ != '{')
+        return 0;
+    for (;;) {
+        cursor = skip_json_space (cursor, end);
+        if (!json_string_end (&cursor, end))
+            return 0;
+        cursor = skip_json_space (cursor, end);
+        if (cursor >= end || *cursor++ != ':')
+            return 0;
+        cursor = skip_json_space (cursor, end);
+        if (cursor >= end)
+            return 0;
+        if (*cursor == '"') {
+            if (!json_string_end (&cursor, end))
+                return 0;
+        } else {
+            while (cursor < end && *cursor != ',' && *cursor != '}')
+                cursor++;
+            if (cursor == end)
+                return 0;
+        }
+        cursor = skip_json_space (cursor, end);
+        if (cursor < end && *cursor == ',') {
+            cursor++;
+            continue;
+        }
+        if (cursor < end && *cursor++ == '}') {
+            cursor = skip_json_space (cursor, end);
+            return cursor == end;
+        }
+        return 0;
+    }
+}
+
+static int
+parts_contain_only_valid_json (const char *directory)
+{
+    struct dirent *entry;
+    char path[1024];
+    char content[4096];
+    DIR *dir;
+
+    dir = opendir (directory);
+    if (!dir)
+        fail ("opendir");
+    while ((entry = readdir (dir))) {
+        int fd;
+        ssize_t length;
+        size_t offset = 0;
+
+        if (0 != strncmp (entry->d_name, "tun2socks.", 10) ||
+            !strstr (entry->d_name, ".jsonl"))
+            continue;
+        snprintf (path, sizeof (path), "%s/%s", directory, entry->d_name);
+        fd = open (path, O_RDONLY);
+        if (fd < 0)
+            fail ("open part");
+        length = read (fd, content, sizeof (content));
+        close (fd);
+        if (length <= 0 || (size_t)length == sizeof (content))
+            fail ("read JSON part");
+        while (offset < (size_t)length) {
+            char *newline = memchr (content + offset, '\n', (size_t)length - offset);
+            size_t line_length;
+
+            if (!newline) {
+                closedir (dir);
+                return 0;
+            }
+            line_length = (size_t)(newline - (content + offset));
+            if (!json_record_is_valid ((unsigned char *)content + offset, line_length)) {
+                closedir (dir);
+                return 0;
+            }
+            offset += line_length + 1;
+        }
+    }
+    closedir (dir);
+    return 1;
+}
+
 static void
 path_for_part (char *path, size_t length, const char *directory, unsigned int number)
 {
@@ -678,6 +858,41 @@ test_long_formatted_messages_have_marker (const char *directory)
 }
 
 static void
+test_invalid_utf8_becomes_valid_json (const char *directory)
+{
+    HevSocks5LogHistoryPolicy policy = { 2048, 8192, 4 };
+    char invalid[] = { 'b', 'a', 'd', (char)0xff, 0 };
+    char truncated[] = { 'e', 'n', 'd', (char)0xd0, 0 };
+    char overlong[] = { (char)0xc0, (char)0xaf, 0 };
+    char surrogate[] = { (char)0xed, (char)0xa0, (char)0x80, 0 };
+    char out_of_range[] = { (char)0xf4, (char)0x90, (char)0x80, (char)0x80, 0 };
+    char valid[] = { (char)0xd0, (char)0x96, (char)0xd0, (char)0xb8,
+                     (char)0xd0, (char)0xb2, (char)0xd0, (char)0xbe,
+                     (char)0xd0, (char)0xb9, 0 };
+
+    expect (0 == hev_socks5_tunnel_log_history_configure (directory, NULL, &policy),
+            "configure invalid UTF-8");
+    expect (0 == hev_logger_init (HEV_LOGGER_DEBUG, "stdout"),
+            "initialize root invalid UTF-8");
+    expect (0 == hev_socks5_logger_init (HEV_SOCKS5_LOGGER_DEBUG, "stdout"),
+            "initialize core invalid UTF-8");
+    hev_logger_log (HEV_LOGGER_INFO, "%s", invalid);
+    hev_socks5_logger_log (HEV_SOCKS5_LOGGER_INFO, "%s", truncated);
+    hev_logger_log (HEV_LOGGER_INFO, "%s", overlong);
+    hev_socks5_logger_log (HEV_SOCKS5_LOGGER_INFO, "%s", surrogate);
+    hev_logger_log (HEV_LOGGER_INFO, "%s", out_of_range);
+    hev_socks5_logger_log (HEV_SOCKS5_LOGGER_INFO, "%s", valid);
+    expect (parts_contain_only_valid_json (directory),
+            "invalid UTF-8 does not escape JSONL");
+    expect (parts_contain (directory, "\xef\xbf\xbd"),
+            "invalid UTF-8 is replaced");
+    expect (parts_contain (directory, valid),
+            "valid multi-byte UTF-8 survives");
+    hev_socks5_logger_fini ();
+    hev_logger_fini ();
+}
+
+static void
 test_restart_does_not_report_persisted_active_state (const char *directory)
 {
     char path[1024];
@@ -774,6 +989,7 @@ main (void)
     char startup_cleanup_template[] = "/tmp/hev-log-history-startup-cleanup.XXXXXX";
 #endif
     char truncation_template[] = "/tmp/hev-log-history-truncation.XXXXXX";
+    char invalid_utf8_template[] = "/tmp/hev-log-history-invalid-utf8.XXXXXX";
     char restart_template[] = "/tmp/hev-log-history-restart.XXXXXX";
     char metadata_template[] = "/tmp/hev-log-history-metadata.XXXXXX";
     char disable_template[] = "/tmp/hev-log-history-disable.XXXXXX";
@@ -850,6 +1066,11 @@ main (void)
     if (!directory)
         fail ("mkdtemp");
     test_long_formatted_messages_have_marker (directory);
+
+    directory = mkdtemp (invalid_utf8_template);
+    if (!directory)
+        fail ("mkdtemp");
+    test_invalid_utf8_becomes_valid_json (directory);
 
     directory = mkdtemp (restart_template);
     if (!directory)
