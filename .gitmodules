@@ -9,4 +9,4 @@
 	url = https://github.com/heiher/lwip
 [submodule "src/core"]
 	path = src/core
-	url = https://github.com/heiher/hev-socks5-core
+	url = https://github.com/SnowLukin/hev-socks5-core.git
