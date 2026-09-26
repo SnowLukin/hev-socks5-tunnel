@@ -54,6 +54,10 @@ static int udp_evict_min_idle;
 static int tcp_evict_min_idle;
 static int udp_queue_frames;
 static int udp_queue_total_frames;
+static int udp_protect_age;
+static int udp_protect_idle;
+static int tcp_protect_age;
+static int tcp_protect_idle;
 static int log_level;
 
 static int
@@ -403,6 +407,14 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             udp_queue_frames = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "udp-queue-total-frames"))
             udp_queue_total_frames = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "udp-evict-protect-age"))
+            udp_protect_age = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "udp-evict-protect-idle"))
+            udp_protect_idle = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "tcp-evict-protect-age"))
+            tcp_protect_age = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "tcp-evict-protect-idle"))
+            tcp_protect_idle = strtoul (value, NULL, 10);
     }
 
     if (udp_queue_frames <= 0 || udp_queue_frames > UDP_POOL_SIZE + 1)
@@ -516,6 +528,10 @@ hev_config_reset (void)
     tcp_evict_min_idle = 60000;
     udp_queue_frames = UDP_POOL_SIZE + 1;
     udp_queue_total_frames = 0;
+    udp_protect_age = 0;
+    udp_protect_idle = 0;
+    tcp_protect_age = 0;
+    tcp_protect_idle = 0;
     log_level = HEV_LOGGER_WARN;
 }
 
@@ -779,6 +795,30 @@ int
 hev_config_get_misc_udp_queue_total_frames (void)
 {
     return udp_queue_total_frames;
+}
+
+int
+hev_config_get_misc_udp_evict_protect_age (void)
+{
+    return udp_protect_age;
+}
+
+int
+hev_config_get_misc_udp_evict_protect_idle (void)
+{
+    return udp_protect_idle;
+}
+
+int
+hev_config_get_misc_tcp_evict_protect_age (void)
+{
+    return tcp_protect_age;
+}
+
+int
+hev_config_get_misc_tcp_evict_protect_idle (void)
+{
+    return tcp_protect_idle;
 }
 
 const char *

@@ -1188,10 +1188,18 @@ session_limits_init (void)
     __atomic_store_n (&session_evict_idle_ms[SESSION_TCP],
                       hev_config_get_misc_tcp_evict_min_idle (),
                       __ATOMIC_RELAXED);
-    for (i = 0; i < SESSION_TYPES; i++) {
-        __atomic_store_n (&session_protect_age_ms[i], 0, __ATOMIC_RELAXED);
-        __atomic_store_n (&session_protect_idle_ms[i], 0, __ATOMIC_RELAXED);
-    }
+    __atomic_store_n (&session_protect_age_ms[SESSION_UDP],
+                      hev_config_get_misc_udp_evict_protect_age (),
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&session_protect_idle_ms[SESSION_UDP],
+                      hev_config_get_misc_udp_evict_protect_idle (),
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&session_protect_age_ms[SESSION_TCP],
+                      hev_config_get_misc_tcp_evict_protect_age (),
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&session_protect_idle_ms[SESSION_TCP],
+                      hev_config_get_misc_tcp_evict_protect_idle (),
+                      __ATOMIC_RELAXED);
 
     hev_socks5_session_udp_set_queue_cap (
         hev_config_get_misc_udp_queue_frames (),

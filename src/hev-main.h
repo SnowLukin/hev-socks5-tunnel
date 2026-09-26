@@ -160,8 +160,9 @@ int hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames,
  *            least this long
  *
  * Eviction at the cap takes the least recently active session that is not
- * protected. Every tunnel start turns the protection off. Safe to call from
- * any thread.
+ * protected. Every tunnel start applies misc.udp-evict-protect-age /
+ * misc.udp-evict-protect-idle (tcp- for TCP) again, off if they are not set.
+ * Safe to call from any thread.
  *
  * Returns: zero, or -1 for invalid arguments.
  */
