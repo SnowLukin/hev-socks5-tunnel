@@ -272,6 +272,27 @@ exit:
 }
 
 static void
+udp_refuse_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                    const ip_addr_t *addr, u16_t port)
+{
+    pbuf_free (p);
+    udp_recv (pcb, NULL, NULL);
+    udp_remove (pcb);
+}
+
+/*
+ * lwIP hands the listener a fresh pcb and then looks the datagram up again.
+ * Removing that pcb here would make lwIP create the next one and call the
+ * listener again forever, so a refused datagram is dropped on the second
+ * lookup instead, like the mapped DNS reply.
+ */
+static void
+udp_refuse (struct udp_pcb *pcb)
+{
+    udp_recv (pcb, udp_refuse_handler, NULL);
+}
+
+static void
 udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
                   const ip_addr_t *addr, u16_t port)
 {
@@ -282,7 +303,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevTask *task;
 
     if (!READ_ONCE (run)) {
-        udp_remove (pcb);
+        udp_refuse (pcb);
         return;
     }
 
@@ -296,16 +317,17 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         }
     }
 
-    udp = hev_socks5_session_udp_new (pcb, &mutex);
-    if (!udp) {
-        udp_remove (pcb);
-        return;
-    }
-
     stack_size = hev_config_get_misc_task_stack_size ();
     task = hev_task_new (stack_size);
     if (!task) {
-        hev_object_unref (HEV_OBJECT (udp));
+        udp_refuse (pcb);
+        return;
+    }
+
+    udp = hev_socks5_session_udp_new (pcb, &mutex);
+    if (!udp) {
+        hev_task_unref (task);
+        udp_refuse (pcb);
         return;
     }
 
