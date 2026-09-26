@@ -137,6 +137,8 @@ static int64_t probe_last_kb = -1;
 #define YOUNG_RING 128
 static int64_t young_ring[YOUNG_RING];
 static unsigned int young_head;
+/* The last admitted session took the place of an evicted one. */
+static int admit_replaced;
 
 typedef struct _HevSocks5TunnelRelief HevSocks5TunnelRelief;
 
@@ -416,6 +418,7 @@ session_admit (int type)
     int64_t now = monotonic_ms ();
     int state, cap;
 
+    admit_replaced = 0;
     state = admission_for (type, probe_update (now));
 
     if (state >= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED) {
@@ -429,8 +432,10 @@ session_admit (int type)
         return 0;
 
     /* At the cap, and in HOLD at any count: only in place of a silent one. */
-    if (session_evict_idle (type, now) == 0)
+    if (session_evict_idle (type, now) == 0) {
+        admit_replaced = 1;
         return 0;
+    }
 
     if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD)
         stat_inc (&stat_refused_adm[type]);
@@ -477,7 +482,13 @@ hev_socks5_tunnel_insert_session (HevListNode *node)
                       session_live_count[sd->type] + 1, __ATOMIC_RELAXED);
     session_count++;
     stat_inc (&stat_created[sd->type]);
-    young_ring[young_head++ % YOUNG_RING] = sd->create_time;
+    /*
+     * A replacement frees the evicted session's memory as it takes its own,
+     * so only net growth reserves memory for young sessions.
+     */
+    if (!admit_replaced)
+        young_ring[young_head++ % YOUNG_RING] = sd->create_time;
+    admit_replaced = 0;
 
     session_rotate ();
 }
