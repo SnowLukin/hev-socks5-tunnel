@@ -93,9 +93,9 @@ enum
  * Asynchronously close matching sessions to give memory back, e.g. on a
  * memory pressure warning. The tunnel keeps running; closed UDP flows get a
  * new session on their next packet, closed TCP connections are reset. Safe
- * to call from any thread while the tunnel runs.
+ * to call from any thread, also while the tunnel starts or stops.
  *
- * Returns: returns zero on successful, otherwise returns -1.
+ * Returns: returns zero on successful, -1 if the tunnel is not running.
  */
 int hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count);
 

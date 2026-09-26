@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
+#include <pthread.h>
 #include <time.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -58,6 +59,7 @@ static int tun_fd_local;
 static int session_count;
 static int event_fds[2] = { -1, -1 };
 static int relief_fds[2] = { -1, -1 };
+static pthread_mutex_t relief_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static size_t stat_tx_packets;
 static size_t stat_rx_packets;
@@ -675,13 +677,19 @@ static int
 relief_task_init (void)
 {
     int nonblock = 1;
+    int fds[2];
     int res;
 
-    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, relief_fds);
+    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, fds);
     if (res < 0) {
         LOG_E ("socks5 tunnel relief");
         return -1;
     }
+
+    pthread_mutex_lock (&relief_mutex);
+    relief_fds[0] = fds[0];
+    relief_fds[1] = fds[1];
+    pthread_mutex_unlock (&relief_mutex);
 
     res = ioctl (relief_fds[0], FIONBIO, (char *)&nonblock);
     if (res < 0) {
@@ -712,6 +720,8 @@ relief_task_fini (void)
         task_relief = NULL;
     }
 
+    /* Under the lock: a concurrent relieve must not write to a closed fd. */
+    pthread_mutex_lock (&relief_mutex);
     if (relief_fds[0] >= 0) {
         close (relief_fds[0]);
         relief_fds[0] = -1;
@@ -720,6 +730,7 @@ relief_task_fini (void)
         close (relief_fds[1]);
         relief_fds[1] = -1;
     }
+    pthread_mutex_unlock (&relief_mutex);
 }
 
 static int
@@ -932,14 +943,13 @@ int
 hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
 {
     HevSocks5TunnelRelief relief = { types, idle_ms, max_count };
-    ssize_t res;
-    int fd;
+    ssize_t res = -1;
 
-    fd = READ_ONCE (relief_fds[1]);
-    if (fd < 0)
-        return -1;
+    pthread_mutex_lock (&relief_mutex);
+    if (relief_fds[1] >= 0)
+        res = write (relief_fds[1], &relief, sizeof (relief));
+    pthread_mutex_unlock (&relief_mutex);
 
-    res = write (fd, &relief, sizeof (relief));
     if (res != sizeof (relief))
         return -1;
 
