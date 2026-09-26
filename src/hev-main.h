@@ -152,6 +152,23 @@ int hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames,
                                          int total_frames);
 
 /**
+ * hev_socks5_tunnel_set_evict_protect:
+ * @type: one HEV_SOCKS5_TUNNEL_SESSION_* value
+ * @min_age_ms: a session that got data from upstream and is at least this
+ *            old counts as an established conversation; 0 turns it off
+ * @min_idle_ms: an established conversation is evicted only when silent at
+ *            least this long
+ *
+ * Eviction at the cap takes the least recently active session that is not
+ * protected. Every tunnel start turns the protection off. Safe to call from
+ * any thread.
+ *
+ * Returns: zero, or -1 for invalid arguments.
+ */
+int hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms,
+                                         int min_idle_ms);
+
+/**
  * HevSocks5TunnelAdmission:
  * @HEV_SOCKS5_TUNNEL_ADMIT_OPEN: new sessions limited only by the caps
  * @HEV_SOCKS5_TUNNEL_ADMIT_HOLD: no growth, a new session only in place of
@@ -213,6 +230,19 @@ int hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
                                         int hold_below_kb, int close_below_kb,
                                         int hysteresis_kb, int young_ms,
                                         int young_reserve_kb);
+
+/**
+ * hev_socks5_tunnel_set_memory_probe_types:
+ * @hold_types: HEV_SOCKS5_TUNNEL_SESSION_* mask the probe may put in HOLD
+ * @close_types: mask the probe may put in CLOSED; a type out of it gets
+ *            HOLD instead if @hold_types has it, otherwise stays OPEN
+ *
+ * Both default to all types. The setting outlives tunnel restarts. Safe to
+ * call from any thread.
+ *
+ * Returns: zero, or -1 for invalid arguments.
+ */
+int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
 
 /**
  * HevSocks5TunnelSessionStats:

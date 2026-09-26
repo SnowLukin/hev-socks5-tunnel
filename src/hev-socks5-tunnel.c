@@ -93,6 +93,12 @@ static int session_dying_count;
 /* Written from any thread, read by the tunnel thread. */
 static int session_cap[SESSION_TYPES];
 static int session_evict_idle_ms[SESSION_TYPES];
+static int session_protect_age_ms[SESSION_TYPES];
+static int session_protect_idle_ms[SESSION_TYPES];
+static int probe_hold_types = HEV_SOCKS5_TUNNEL_SESSION_UDP |
+                              HEV_SOCKS5_TUNNEL_SESSION_TCP;
+static int probe_close_types = HEV_SOCKS5_TUNNEL_SESSION_UDP |
+                               HEV_SOCKS5_TUNNEL_SESSION_TCP;
 
 /* Written by the tunnel thread, read from any thread. */
 static uint64_t stat_created[SESSION_TYPES];
@@ -269,25 +275,41 @@ session_lru (int type)
 /*
  * A new session of this type may take the place of the least recently
  * active one only if that one has been silent long enough: a call or a
- * download never goes silent, a one-shot flow does.
+ * download never goes silent, a one-shot flow does. An established
+ * conversation (got a reply and lived protect_age) keeps its place until it
+ * is silent protect_idle, so a keep-alive every few seconds survives a storm
+ * of one-shot flows.
  */
 static int
 session_evict_idle (int type, int64_t now)
 {
-    HevSocks5SessionData *sd = session_lru (type);
-    int idle_ms;
-
-    if (!sd)
-        return -1;
+    int idle_ms, protect_age, protect_idle;
+    HevListNode *node;
 
     idle_ms = __atomic_load_n (&session_evict_idle_ms[type], __ATOMIC_RELAXED);
-    if (now - sd->active_time < idle_ms)
-        return -1;
+    protect_age =
+        __atomic_load_n (&session_protect_age_ms[type], __ATOMIC_RELAXED);
+    protect_idle =
+        __atomic_load_n (&session_protect_idle_ms[type], __ATOMIC_RELAXED);
 
-    session_kill (sd);
-    stat_inc (&stat_evicted[type]);
+    node = hev_list_first (&session_live[type]);
+    for (; node; node = hev_list_node_next (node)) {
+        HevSocks5SessionData *sd;
 
-    return 0;
+        sd = container_of (node, HevSocks5SessionData, node);
+        if (now - sd->active_time < idle_ms)
+            break;
+        if (protect_age > 0 && sd->answered &&
+            now - sd->create_time >= protect_age &&
+            now - sd->active_time < protect_idle)
+            continue;
+
+        session_kill (sd);
+        stat_inc (&stat_evicted[type]);
+        return 0;
+    }
+
+    return -1;
 }
 
 static int
@@ -378,6 +400,12 @@ session_admit (int type)
     int state, ext, cap;
 
     state = probe_update (now);
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_CLOSED &&
+        !(__atomic_load_n (&probe_close_types, __ATOMIC_RELAXED) & (1 << type)))
+        state = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD &&
+        !(__atomic_load_n (&probe_hold_types, __ATOMIC_RELAXED) & (1 << type)))
+        state = HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
     ext = __atomic_load_n (&admission_ext[type], __ATOMIC_RELAXED);
     if (ext > state)
         state = ext;
@@ -1141,6 +1169,10 @@ session_limits_init (void)
     __atomic_store_n (&session_evict_idle_ms[SESSION_TCP],
                       hev_config_get_misc_tcp_evict_min_idle (),
                       __ATOMIC_RELAXED);
+    for (i = 0; i < SESSION_TYPES; i++) {
+        __atomic_store_n (&session_protect_age_ms[i], 0, __ATOMIC_RELAXED);
+        __atomic_store_n (&session_protect_idle_ms[i], 0, __ATOMIC_RELAXED);
+    }
 
     hev_socks5_session_udp_set_queue_cap (
         hev_config_get_misc_udp_queue_frames (),
@@ -1357,6 +1389,37 @@ hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames, int total_frames)
         total_frames = hev_config_get_misc_udp_queue_total_frames ();
 
     hev_socks5_session_udp_set_queue_cap (per_session_frames, total_frames);
+
+    return 0;
+}
+
+int
+hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms,
+                                     int min_idle_ms)
+{
+    int i = session_index (type);
+
+    if (i < 0 || min_age_ms < 0 || min_idle_ms < 0)
+        return -1;
+
+    __atomic_store_n (&session_protect_age_ms[i], min_age_ms,
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&session_protect_idle_ms[i], min_idle_ms,
+                      __ATOMIC_RELAXED);
+
+    return 0;
+}
+
+int
+hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types)
+{
+    int all = HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP;
+
+    if ((hold_types & ~all) || (close_types & ~all))
+        return -1;
+
+    __atomic_store_n (&probe_hold_types, hold_types, __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_close_types, close_types, __ATOMIC_RELAXED);
 
     return 0;
 }

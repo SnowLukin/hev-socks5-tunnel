@@ -217,6 +217,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
         }
     }
 
+    self->data.answered = 1;
     return 1;
 }
 

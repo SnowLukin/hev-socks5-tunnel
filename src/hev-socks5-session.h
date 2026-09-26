@@ -32,6 +32,7 @@ struct _HevSocks5SessionData
     int64_t active_time;
     int type;
     int dying;
+    int answered;
 };
 
 struct _HevSocks5SessionIface
