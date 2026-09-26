@@ -393,22 +393,30 @@ probe_update (int64_t now)
     return state;
 }
 
+/* The probe state as it applies to one type, combined with the caller's. */
+static int
+admission_for (int type, int probe)
+{
+    int ext;
+
+    if (probe == HEV_SOCKS5_TUNNEL_ADMIT_CLOSED &&
+        !(__atomic_load_n (&probe_close_types, __ATOMIC_RELAXED) & (1 << type)))
+        probe = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
+    if (probe == HEV_SOCKS5_TUNNEL_ADMIT_HOLD &&
+        !(__atomic_load_n (&probe_hold_types, __ATOMIC_RELAXED) & (1 << type)))
+        probe = HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
+
+    ext = __atomic_load_n (&admission_ext[type], __ATOMIC_RELAXED);
+    return ext > probe ? ext : probe;
+}
+
 static int
 session_admit (int type)
 {
     int64_t now = monotonic_ms ();
-    int state, ext, cap;
+    int state, cap;
 
-    state = probe_update (now);
-    if (state == HEV_SOCKS5_TUNNEL_ADMIT_CLOSED &&
-        !(__atomic_load_n (&probe_close_types, __ATOMIC_RELAXED) & (1 << type)))
-        state = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
-    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD &&
-        !(__atomic_load_n (&probe_hold_types, __ATOMIC_RELAXED) & (1 << type)))
-        state = HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
-    ext = __atomic_load_n (&admission_ext[type], __ATOMIC_RELAXED);
-    if (ext > state)
-        state = ext;
+    state = admission_for (type, probe_update (now));
 
     if (state >= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED) {
         stat_inc (&stat_refused_adm[type]);
@@ -1506,12 +1514,9 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
                                          __ATOMIC_RELAXED);
     s.tcp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_TCP],
                                          __ATOMIC_RELAXED);
-    for (i = 0; i < SESSION_TYPES; i++) {
-        int st = __atomic_load_n (&probe_state, __ATOMIC_RELAXED);
-        int ext = __atomic_load_n (&admission_ext[i], __ATOMIC_RELAXED);
-
-        admission[i] = ext > st ? ext : st;
-    }
+    for (i = 0; i < SESSION_TYPES; i++)
+        admission[i] = admission_for (
+            i, __atomic_load_n (&probe_state, __ATOMIC_RELAXED));
     s.admission_udp = admission[SESSION_UDP];
     s.admission_tcp = admission[SESSION_TCP];
 
