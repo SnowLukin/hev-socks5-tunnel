@@ -99,6 +99,38 @@ static uint64_t stat_created[SESSION_TYPES];
 static uint64_t stat_evicted[SESSION_TYPES];
 static uint64_t stat_refused[SESSION_TYPES];
 static uint64_t stat_relieved[SESSION_TYPES];
+static uint64_t stat_refused_adm[SESSION_TYPES];
+
+/* HEV_SOCKS5_TUNNEL_ADMIT_* set from outside. */
+static int admission_ext[SESSION_TYPES];
+
+typedef struct _HevSocks5TunnelProbe HevSocks5TunnelProbe;
+
+struct _HevSocks5TunnelProbe
+{
+    HevSocks5TunnelMemoryProbe probe;
+    void *user_data;
+    int interval_ms;
+    int hold_below_kb;
+    int close_below_kb;
+    int hysteresis_kb;
+    int young_ms;
+    int young_reserve_kb;
+};
+
+/* Set from any thread under probe_mutex, outlives tunnel restarts. */
+static HevSocks5TunnelProbe probe_conf;
+static pthread_mutex_t probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int64_t probe_next_ms;
+
+/* Tunnel thread; probe_state and probe_last_kb are also read by stats. */
+static HevSocks5TunnelProbe probe_cur;
+static int probe_state;
+static int64_t probe_last_kb = -1;
+
+#define YOUNG_RING 128
+static int64_t young_ring[YOUNG_RING];
+static unsigned int young_head;
 
 typedef struct _HevSocks5TunnelRelief HevSocks5TunnelRelief;
 
@@ -259,17 +291,114 @@ session_evict_idle (int type, int64_t now)
 }
 
 static int
+young_count (int64_t now, int young_ms)
+{
+    unsigned int i;
+    int n = 0;
+
+    for (i = 0; i < YOUNG_RING; i++) {
+        int64_t t = young_ring[(young_head - 1 - i) % YOUNG_RING];
+
+        if (!t || now - t >= young_ms)
+            break;
+        n++;
+    }
+
+    return n;
+}
+
+/*
+ * Memory the process can still take, minus what sessions created in the last
+ * young_ms are about to take: a new session reaches its full price only after
+ * its upstream connection is up, later than the probe sees it.
+ */
+static int
+probe_update (int64_t now)
+{
+    HevSocks5TunnelProbe *c = &probe_cur;
+    int64_t avail_kb;
+    int state, prev;
+
+    if (now >= __atomic_load_n (&probe_next_ms, __ATOMIC_RELAXED)) {
+        int64_t raw = -1;
+
+        pthread_mutex_lock (&probe_mutex);
+        *c = probe_conf;
+        pthread_mutex_unlock (&probe_mutex);
+
+        __atomic_store_n (&probe_next_ms,
+                          now + (c->probe ? c->interval_ms : 1000),
+                          __ATOMIC_RELAXED);
+        if (c->probe)
+            raw = c->probe (c->user_data);
+        __atomic_store_n (&probe_last_kb, raw < 0 ? -1 : raw / 1024,
+                          __ATOMIC_RELAXED);
+    }
+
+    avail_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
+    prev = probe_state;
+    if (!c->probe) {
+        __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
+                          __ATOMIC_RELAXED);
+        return HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
+    }
+    if (avail_kb < 0)
+        return prev;
+
+    avail_kb -= (int64_t)young_count (now, c->young_ms) * c->young_reserve_kb;
+
+    if (avail_kb < c->close_below_kb)
+        state = HEV_SOCKS5_TUNNEL_ADMIT_CLOSED;
+    else if (avail_kb < c->hold_below_kb)
+        state = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
+    else
+        state = HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
+
+    if (state < prev) {
+        if (prev == HEV_SOCKS5_TUNNEL_ADMIT_CLOSED &&
+            avail_kb < c->close_below_kb + c->hysteresis_kb)
+            state = HEV_SOCKS5_TUNNEL_ADMIT_CLOSED;
+        else if (avail_kb < c->hold_below_kb + c->hysteresis_kb)
+            state = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
+    }
+
+    if (state != prev) {
+        LOG_W ("socks5 tunnel admission %d -> %d, available %lld KiB", prev,
+               state, (long long)avail_kb);
+        __atomic_store_n (&probe_state, state, __ATOMIC_RELAXED);
+    }
+
+    return state;
+}
+
+static int
 session_admit (int type)
 {
-    int cap;
+    int64_t now = monotonic_ms ();
+    int state, ext, cap;
+
+    state = probe_update (now);
+    ext = __atomic_load_n (&admission_ext[type], __ATOMIC_RELAXED);
+    if (ext > state)
+        state = ext;
+
+    if (state >= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED) {
+        stat_inc (&stat_refused_adm[type]);
+        goto refuse;
+    }
 
     cap = __atomic_load_n (&session_cap[type], __ATOMIC_RELAXED);
-    if (cap <= 0 || session_live_count[type] < cap)
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_OPEN &&
+        (cap <= 0 || session_live_count[type] < cap))
         return 0;
 
-    if (session_evict_idle (type, monotonic_ms ()) == 0)
+    /* At the cap, and in HOLD at any count: only in place of a silent one. */
+    if (session_evict_idle (type, now) == 0)
         return 0;
 
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD)
+        stat_inc (&stat_refused_adm[type]);
+refuse:
     stat_inc (&stat_refused[type]);
     return -1;
 }
@@ -312,6 +441,7 @@ hev_socks5_tunnel_insert_session (HevListNode *node)
                       session_live_count[sd->type] + 1, __ATOMIC_RELAXED);
     session_count++;
     stat_inc (&stat_created[sd->type]);
+    young_ring[young_head++ % YOUNG_RING] = sd->create_time;
 
     session_rotate ();
 }
@@ -1012,7 +1142,15 @@ session_limits_init (void)
                       hev_config_get_misc_tcp_evict_min_idle (),
                       __ATOMIC_RELAXED);
 
+    __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
+    memset (young_ring, 0, sizeof (young_ring));
+
     for (i = 0; i < SESSION_TYPES; i++) {
+        __atomic_store_n (&admission_ext[i], HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
+                          __ATOMIC_RELAXED);
+        __atomic_store_n (&stat_refused_adm[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_created[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_evicted[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_refused[i], 0, __ATOMIC_RELAXED);
@@ -1203,9 +1341,51 @@ hev_socks5_tunnel_set_session_cap (int type, int max_live,
 }
 
 int
+hev_socks5_tunnel_set_admission (int types, int state)
+{
+    int i;
+
+    if (state < HEV_SOCKS5_TUNNEL_ADMIT_OPEN ||
+        state > HEV_SOCKS5_TUNNEL_ADMIT_CLOSED)
+        return -1;
+    if (types & ~(HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP))
+        return -1;
+
+    for (i = 0; i < SESSION_TYPES; i++)
+        if (types & (1 << i))
+            __atomic_store_n (&admission_ext[i], state, __ATOMIC_RELAXED);
+
+    return 0;
+}
+
+int
+hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
+                                    void *user_data, int interval_ms,
+                                    int hold_below_kb, int close_below_kb,
+                                    int hysteresis_kb, int young_ms,
+                                    int young_reserve_kb)
+{
+    HevSocks5TunnelProbe c = { probe,         user_data,      interval_ms,
+                               hold_below_kb, close_below_kb, hysteresis_kb,
+                               young_ms,      young_reserve_kb };
+
+    if (c.interval_ms <= 0)
+        c.interval_ms = 50;
+
+    pthread_mutex_lock (&probe_mutex);
+    probe_conf = c;
+    pthread_mutex_unlock (&probe_mutex);
+    __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
+
+    return 0;
+}
+
+int
 hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
 {
     HevSocks5TunnelSessionStats s;
+    int admission[SESSION_TYPES];
+    int i;
 
     if (!stats || stats->size < sizeof (s))
         return -1;
@@ -1235,7 +1415,19 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
                                       __ATOMIC_RELAXED);
     s.udp_cap = __atomic_load_n (&session_cap[SESSION_UDP], __ATOMIC_RELAXED);
     s.tcp_cap = __atomic_load_n (&session_cap[SESSION_TCP], __ATOMIC_RELAXED);
-    s.last_probe_kb = -1;
+    s.last_probe_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
+    s.udp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_UDP],
+                                         __ATOMIC_RELAXED);
+    s.tcp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_TCP],
+                                         __ATOMIC_RELAXED);
+    for (i = 0; i < SESSION_TYPES; i++) {
+        int st = __atomic_load_n (&probe_state, __ATOMIC_RELAXED);
+        int ext = __atomic_load_n (&admission_ext[i], __ATOMIC_RELAXED);
+
+        admission[i] = ext > st ? ext : st;
+    }
+    s.admission_udp = admission[SESSION_UDP];
+    s.admission_tcp = admission[SESSION_TCP];
 
     *stats = s;
 

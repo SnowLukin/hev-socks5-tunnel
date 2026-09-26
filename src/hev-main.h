@@ -134,6 +134,69 @@ int hev_socks5_tunnel_set_session_cap (int type, int max_live,
                                        int evict_min_idle_ms);
 
 /**
+ * HevSocks5TunnelAdmission:
+ * @HEV_SOCKS5_TUNNEL_ADMIT_OPEN: new sessions limited only by the caps
+ * @HEV_SOCKS5_TUNNEL_ADMIT_HOLD: no growth, a new session only in place of
+ *            a silent one of the same type (as at the cap)
+ * @HEV_SOCKS5_TUNNEL_ADMIT_CLOSED: no new sessions, live ones keep working
+ */
+enum
+{
+    HEV_SOCKS5_TUNNEL_ADMIT_OPEN = 0,
+    HEV_SOCKS5_TUNNEL_ADMIT_HOLD = 1,
+    HEV_SOCKS5_TUNNEL_ADMIT_CLOSED = 2,
+};
+
+/**
+ * hev_socks5_tunnel_set_admission:
+ * @types: HEV_SOCKS5_TUNNEL_SESSION_* mask
+ * @state: HEV_SOCKS5_TUNNEL_ADMIT_*
+ *
+ * Admission state set by the caller. The stricter of this and the state
+ * derived from the memory probe is in effect. Every tunnel start resets it to
+ * OPEN. Safe to call from any thread.
+ *
+ * Returns: zero, or -1 for invalid arguments.
+ */
+int hev_socks5_tunnel_set_admission (int types, int state);
+
+/**
+ * HevSocks5TunnelMemoryProbe:
+ * @user_data: as passed to hev_socks5_tunnel_set_memory_probe
+ *
+ * Called on the tunnel thread while a packet is being handled, so it must be
+ * fast and must not block.
+ *
+ * Returns: bytes the process can still allocate before its limit, negative
+ * if unknown.
+ */
+typedef long long (*HevSocks5TunnelMemoryProbe) (void *user_data);
+
+/**
+ * hev_socks5_tunnel_set_memory_probe:
+ * @probe: callback, NULL to turn the probe off
+ * @user_data: passed to @probe
+ * @interval_ms: call @probe at most this often, the last result is used in
+ *            between (50 if not positive)
+ * @hold_below_kb: less than this available: HEV_SOCKS5_TUNNEL_ADMIT_HOLD
+ * @close_below_kb: less than this available: HEV_SOCKS5_TUNNEL_ADMIT_CLOSED
+ * @hysteresis_kb: leave a state only this far above its threshold
+ * @young_ms: sessions younger than this have not taken their memory yet
+ * @young_reserve_kb: subtracted from the available memory per young session
+ *
+ * The probe is checked when a new session is about to be created, so the
+ * state follows memory from the first packet on without a timer. The setting
+ * outlives tunnel restarts. Safe to call from any thread.
+ *
+ * Returns: zero.
+ */
+int hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
+                                        void *user_data, int interval_ms,
+                                        int hold_below_kb, int close_below_kb,
+                                        int hysteresis_kb, int young_ms,
+                                        int young_reserve_kb);
+
+/**
  * HevSocks5TunnelSessionStats:
  * @size: set by the caller to sizeof (HevSocks5TunnelSessionStats)
  * @udp_live, @tcp_live: live sessions
@@ -147,6 +210,7 @@ int hev_socks5_tunnel_set_session_cap (int type, int max_live,
  * @*_evicted: silent sessions closed to make room for a new one
  * @*_refused: new sessions refused by a cap or by admission
  * @*_relieved: sessions closed by hev_socks5_tunnel_relieve
+ * @*_refused_adm: part of @*_refused due to HOLD or CLOSED admission
  * @udp_queue_dropped: datagrams dropped because a UDP queue was full
  */
 typedef struct
@@ -165,6 +229,7 @@ typedef struct
     unsigned long long udp_evicted, tcp_evicted;
     unsigned long long udp_refused, tcp_refused;
     unsigned long long udp_relieved, tcp_relieved;
+    unsigned long long udp_refused_adm, tcp_refused_adm;
     unsigned long long udp_queue_dropped;
 } HevSocks5TunnelSessionStats;
 
