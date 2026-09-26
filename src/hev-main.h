@@ -100,6 +100,85 @@ enum
 int hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count);
 
 /**
+ * HevSocks5TunnelSessionType:
+ * @HEV_SOCKS5_TUNNEL_SESSION_UDP: UDP sessions
+ * @HEV_SOCKS5_TUNNEL_SESSION_TCP: TCP sessions
+ *
+ * Same values as HEV_SOCKS5_TUNNEL_RELIEF_*, can be combined where a mask
+ * is taken.
+ */
+enum
+{
+    HEV_SOCKS5_TUNNEL_SESSION_UDP = 1,
+    HEV_SOCKS5_TUNNEL_SESSION_TCP = 2,
+};
+
+/**
+ * hev_socks5_tunnel_set_session_cap:
+ * @type: one HEV_SOCKS5_TUNNEL_SESSION_* value
+ * @max_live: most live sessions of this type, 0 for no cap, negative to
+ *            restore misc.udp-max-sessions / misc.tcp-max-sessions
+ * @evict_min_idle_ms: at the cap a new session closes the least recently
+ *            active session of the same type if it has been silent at least
+ *            this long, otherwise the new one is refused (TCP gets a reset,
+ *            the UDP datagram is dropped); negative to restore
+ *            misc.udp-evict-min-idle / misc.tcp-evict-min-idle
+ *
+ * Lowering the cap below the current count closes nothing by itself: the
+ * extra sessions leave by timeout or hev_socks5_tunnel_relieve. Every tunnel
+ * start applies the configured values again. Safe to call from any thread.
+ *
+ * Returns: zero, or -1 for an unknown type.
+ */
+int hev_socks5_tunnel_set_session_cap (int type, int max_live,
+                                       int evict_min_idle_ms);
+
+/**
+ * HevSocks5TunnelSessionStats:
+ * @size: set by the caller to sizeof (HevSocks5TunnelSessionStats)
+ * @udp_live, @tcp_live: live sessions
+ * @dying: closed sessions that have not released their memory yet
+ * @udp_queued_frames: datagrams waiting in all UDP session queues
+ * @admission_udp, @admission_tcp: admission state in effect,
+ *            HEV_SOCKS5_TUNNEL_ADMIT_*
+ * @udp_cap, @tcp_cap: caps in effect, 0 for none
+ * @last_probe_kb: last memory probe result in KiB, negative if none
+ * @*_created: sessions created since the tunnel start
+ * @*_evicted: silent sessions closed to make room for a new one
+ * @*_refused: new sessions refused by a cap or by admission
+ * @*_relieved: sessions closed by hev_socks5_tunnel_relieve
+ * @udp_queue_dropped: datagrams dropped because a UDP queue was full
+ */
+typedef struct
+{
+    unsigned int size;
+    int udp_live;
+    int tcp_live;
+    int dying;
+    int udp_queued_frames;
+    int admission_udp;
+    int admission_tcp;
+    int udp_cap;
+    int tcp_cap;
+    long long last_probe_kb;
+    unsigned long long udp_created, tcp_created;
+    unsigned long long udp_evicted, tcp_evicted;
+    unsigned long long udp_refused, tcp_refused;
+    unsigned long long udp_relieved, tcp_relieved;
+    unsigned long long udp_queue_dropped;
+} HevSocks5TunnelSessionStats;
+
+/**
+ * hev_socks5_tunnel_get_session_stats:
+ * @stats (out): filled in, @stats->size must be set first
+ *
+ * Counters restart with every tunnel start. Safe to call from any thread.
+ *
+ * Returns: zero, or -1 if @stats->size is too small.
+ */
+int hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats);
+
+/**
  * hev_socks5_tunnel_stats:
  * @tx_packets (out): transmitted packets
  * @tx_bytes (out): transmitted bytes

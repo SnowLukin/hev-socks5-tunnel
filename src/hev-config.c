@@ -48,6 +48,10 @@ static int connect_timeout;
 static int tcp_read_write_timeout;
 static int udp_read_write_timeout;
 static int limit_nofile;
+static int udp_max_sessions;
+static int tcp_max_sessions;
+static int udp_evict_min_idle;
+static int tcp_evict_min_idle;
 static int log_level;
 
 static int
@@ -385,6 +389,14 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             log_level = hev_config_parse_log_level (value);
         else if (0 == strcmp (key, "limit-nofile"))
             limit_nofile = strtol (value, NULL, 10);
+        else if (0 == strcmp (key, "udp-max-sessions"))
+            udp_max_sessions = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "tcp-max-sessions"))
+            tcp_max_sessions = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "udp-evict-min-idle"))
+            udp_evict_min_idle = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "tcp-evict-min-idle"))
+            tcp_evict_min_idle = strtoul (value, NULL, 10);
     }
 
     if (tcp_rw_timeout <= 0)
@@ -489,6 +501,10 @@ hev_config_reset (void)
     tcp_read_write_timeout = 300000;
     udp_read_write_timeout = 60000;
     limit_nofile = 65535;
+    udp_max_sessions = 0;
+    tcp_max_sessions = 0;
+    udp_evict_min_idle = 2000;
+    tcp_evict_min_idle = 60000;
     log_level = HEV_LOGGER_WARN;
 }
 
@@ -716,6 +732,30 @@ int
 hev_config_get_misc_limit_nofile (void)
 {
     return limit_nofile;
+}
+
+int
+hev_config_get_misc_udp_max_sessions (void)
+{
+    return udp_max_sessions;
+}
+
+int
+hev_config_get_misc_tcp_max_sessions (void)
+{
+    return tcp_max_sessions;
+}
+
+int
+hev_config_get_misc_udp_evict_min_idle (void)
+{
+    return udp_evict_min_idle;
+}
+
+int
+hev_config_get_misc_tcp_evict_min_idle (void)
+{
+    return tcp_evict_min_idle;
 }
 
 const char *

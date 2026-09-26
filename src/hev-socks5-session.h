@@ -30,6 +30,8 @@ struct _HevSocks5SessionData
     HevSocks5Session *self;
     int64_t create_time;
     int64_t active_time;
+    int type;
+    int dying;
 };
 
 struct _HevSocks5SessionIface
