@@ -62,6 +62,8 @@ int hev_config_get_misc_udp_max_sessions (void);
 int hev_config_get_misc_tcp_max_sessions (void);
 int hev_config_get_misc_udp_evict_min_idle (void);
 int hev_config_get_misc_tcp_evict_min_idle (void);
+int hev_config_get_misc_udp_queue_frames (void);
+int hev_config_get_misc_udp_queue_total_frames (void);
 const char *hev_config_get_misc_pid_file (void);
 const char *hev_config_get_misc_log_file (void);
 int hev_config_get_misc_log_level (void);

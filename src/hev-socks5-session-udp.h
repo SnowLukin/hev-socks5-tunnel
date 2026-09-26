@@ -50,4 +50,10 @@ int hev_socks5_session_udp_construct (HevSocks5SessionUDP *self,
 HevSocks5SessionUDP *hev_socks5_session_udp_new (struct udp_pcb *pcb,
                                                  HevTaskMutex *mutex);
 
+void hev_socks5_session_udp_set_queue_cap (int per_session_frames,
+                                           int total_frames);
+int hev_socks5_session_udp_get_queued_frames (void);
+uint64_t hev_socks5_session_udp_get_queue_dropped (void);
+void hev_socks5_session_udp_reset_queue_stats (void);
+
 #endif /* __HEV_SOCKS5_SESSION_UDP_H__ */

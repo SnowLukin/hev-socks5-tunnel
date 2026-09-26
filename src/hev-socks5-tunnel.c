@@ -1142,6 +1142,11 @@ session_limits_init (void)
                       hev_config_get_misc_tcp_evict_min_idle (),
                       __ATOMIC_RELAXED);
 
+    hev_socks5_session_udp_set_queue_cap (
+        hev_config_get_misc_udp_queue_frames (),
+        hev_config_get_misc_udp_queue_total_frames ());
+    hev_socks5_session_udp_reset_queue_stats ();
+
     __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
                       __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
@@ -1341,6 +1346,22 @@ hev_socks5_tunnel_set_session_cap (int type, int max_live,
 }
 
 int
+hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames, int total_frames)
+{
+    if (per_session_frames > UDP_POOL_SIZE + 1)
+        return -1;
+
+    if (per_session_frames <= 0)
+        per_session_frames = hev_config_get_misc_udp_queue_frames ();
+    if (total_frames < 0)
+        total_frames = hev_config_get_misc_udp_queue_total_frames ();
+
+    hev_socks5_session_udp_set_queue_cap (per_session_frames, total_frames);
+
+    return 0;
+}
+
+int
 hev_socks5_tunnel_set_admission (int types, int state)
 {
     int i;
@@ -1416,6 +1437,8 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     s.udp_cap = __atomic_load_n (&session_cap[SESSION_UDP], __ATOMIC_RELAXED);
     s.tcp_cap = __atomic_load_n (&session_cap[SESSION_TCP], __ATOMIC_RELAXED);
     s.last_probe_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
+    s.udp_queued_frames = hev_socks5_session_udp_get_queued_frames ();
+    s.udp_queue_dropped = hev_socks5_session_udp_get_queue_dropped ();
     s.udp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_UDP],
                                          __ATOMIC_RELAXED);
     s.tcp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_TCP],

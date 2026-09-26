@@ -134,6 +134,24 @@ int hev_socks5_tunnel_set_session_cap (int type, int max_live,
                                        int evict_min_idle_ms);
 
 /**
+ * hev_socks5_tunnel_set_udp_queue_cap:
+ * @per_session_frames: datagrams one UDP session may queue while its upstream
+ *            is not ready, at most 513; zero or negative to restore
+ *            misc.udp-queue-frames
+ * @total_frames: datagrams queued in all UDP sessions together, 0 for no
+ *            limit, negative to restore misc.udp-queue-total-frames
+ *
+ * A datagram over either cap is dropped and counted in udp_queue_dropped.
+ * Every queued datagram holds a full-MTU buffer whatever its size. Every
+ * tunnel start applies the configured values again. Safe to call from any
+ * thread.
+ *
+ * Returns: zero, or -1 for invalid arguments.
+ */
+int hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames,
+                                         int total_frames);
+
+/**
  * HevSocks5TunnelAdmission:
  * @HEV_SOCKS5_TUNNEL_ADMIT_OPEN: new sessions limited only by the caps
  * @HEV_SOCKS5_TUNNEL_ADMIT_HOLD: no growth, a new session only in place of

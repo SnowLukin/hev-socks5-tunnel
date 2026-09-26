@@ -38,6 +38,45 @@ struct _HevSocks5UDPFrame
     struct pbuf *data;
 };
 
+/* Caps written from any thread; the counters belong to the tunnel thread. */
+static int queue_frames_cap = UDP_POOL_SIZE + 1;
+static int queue_total_cap;
+static int queued_total;
+static uint64_t queue_dropped;
+
+static void
+queued_total_add (int n)
+{
+    __atomic_store_n (&queued_total, queued_total + n, __ATOMIC_RELAXED);
+}
+
+void
+hev_socks5_session_udp_set_queue_cap (int per_session_frames,
+                                      int total_frames)
+{
+    __atomic_store_n (&queue_frames_cap, per_session_frames,
+                      __ATOMIC_RELAXED);
+    __atomic_store_n (&queue_total_cap, total_frames, __ATOMIC_RELAXED);
+}
+
+int
+hev_socks5_session_udp_get_queued_frames (void)
+{
+    return __atomic_load_n (&queued_total, __ATOMIC_RELAXED);
+}
+
+uint64_t
+hev_socks5_session_udp_get_queue_dropped (void)
+{
+    return __atomic_load_n (&queue_dropped, __ATOMIC_RELAXED);
+}
+
+void
+hev_socks5_session_udp_reset_queue_stats (void)
+{
+    __atomic_store_n (&queue_dropped, 0, __ATOMIC_RELAXED);
+}
+
 static int
 task_io_yielder (HevTaskYieldType type, void *data)
 {
@@ -109,6 +148,7 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self, unsigned int num)
         pbuf_free (buf);
         self->frames--;
     }
+    queued_total_add (-res);
 
     return 1;
 }
@@ -186,13 +226,22 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     HevSocks5SessionUDP *self = arg;
     HevSocks5UDPFrame *frame;
+    int total_cap;
 
     if (!p) {
         hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));
         return;
     }
 
-    if (self->frames > UDP_POOL_SIZE) {
+    /*
+     * Every queued datagram holds a full-MTU buffer, so the queues are capped
+     * in frames: while the upstream is slow, a session drops what does not fit
+     * instead of growing outside the Go memory limit.
+     */
+    total_cap = __atomic_load_n (&queue_total_cap, __ATOMIC_RELAXED);
+    if (self->frames >= __atomic_load_n (&queue_frames_cap, __ATOMIC_RELAXED) ||
+        (total_cap > 0 && queued_total >= total_cap)) {
+        __atomic_fetch_add (&queue_dropped, 1, __ATOMIC_RELAXED);
         pbuf_free (p);
         return;
     }
@@ -219,6 +268,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
 
     self->frames++;
+    queued_total_add (1);
     hev_list_add_tail (&self->frame_list, &frame->node);
     hev_task_wakeup (self->data.task);
 }
@@ -389,6 +439,8 @@ hev_socks5_session_udp_destruct (HevObject *base)
         pbuf_free (frame->data);
         hev_free (frame);
     }
+    queued_total_add (-self->frames);
+    self->frames = 0;
 
     hev_task_mutex_lock (self->mutex);
     if (self->pcb) {
