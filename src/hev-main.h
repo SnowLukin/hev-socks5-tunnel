@@ -71,6 +71,35 @@ int hev_socks5_tunnel_main_from_str (const unsigned char *config_str,
 void hev_socks5_tunnel_quit (void);
 
 /**
+ * HevSocks5TunnelReliefType:
+ * @HEV_SOCKS5_TUNNEL_RELIEF_UDP: UDP sessions
+ * @HEV_SOCKS5_TUNNEL_RELIEF_TCP: TCP sessions
+ *
+ * Session types for hev_socks5_tunnel_relieve, can be combined.
+ */
+enum
+{
+    HEV_SOCKS5_TUNNEL_RELIEF_UDP = 1,
+    HEV_SOCKS5_TUNNEL_RELIEF_TCP = 2,
+};
+
+/**
+ * hev_socks5_tunnel_relieve:
+ * @types: session types to close, HEV_SOCKS5_TUNNEL_RELIEF_* flags
+ * @idle_ms: close only sessions without activity for at least this long,
+ *           0 for any
+ * @max_count: close at most this many sessions, oldest first, 0 for no limit
+ *
+ * Asynchronously close matching sessions to give memory back, e.g. on a
+ * memory pressure warning. The tunnel keeps running; closed UDP flows get a
+ * new session on their next packet, closed TCP connections are reset. Safe
+ * to call from any thread while the tunnel runs.
+ *
+ * Returns: returns zero on successful, otherwise returns -1.
+ */
+int hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count);
+
+/**
  * hev_socks5_tunnel_stats:
  * @tx_packets (out): transmitted packets
  * @tx_bytes (out): transmitted bytes

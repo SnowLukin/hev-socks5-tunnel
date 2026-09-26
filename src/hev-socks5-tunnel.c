@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
+#include <time.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <sys/ioctl.h>
@@ -38,6 +39,7 @@
 #include "hev-socks5-session-tcp.h"
 #include "hev-socks5-session-udp.h"
 
+#include "hev-main.h"
 #include "hev-socks5-tunnel.h"
 
 enum
@@ -55,6 +57,7 @@ static int tun_fd = -1;
 static int tun_fd_local;
 static int session_count;
 static int event_fds[2] = { -1, -1 };
+static int relief_fds[2] = { -1, -1 };
 
 static size_t stat_tx_packets;
 static size_t stat_rx_packets;
@@ -69,7 +72,31 @@ static HevTaskMutex mutex;
 static HevTask *task_event;
 static HevTask *task_lwip_io;
 static HevTask *task_lwip_timer;
+static HevTask *task_relief;
 static HevList session_set;
+
+typedef struct _HevSocks5TunnelRelief HevSocks5TunnelRelief;
+
+struct _HevSocks5TunnelRelief
+{
+    int types;
+    int idle_ms;
+    int max_count;
+};
+
+static int64_t
+monotonic_ms (void)
+{
+    struct timespec ts;
+
+#ifdef CLOCK_MONOTONIC_COARSE
+    clock_gettime (CLOCK_MONOTONIC_COARSE, &ts);
+#else
+    clock_gettime (CLOCK_MONOTONIC, &ts);
+#endif
+
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static int
 task_io_yielder (HevTaskYieldType type, void *data)
@@ -127,6 +154,10 @@ hev_socks5_tunnel_insert_session (HevListNode *node)
     HevSocks5SessionData *sd;
     int max_session_count;
 
+    sd = container_of (node, HevSocks5SessionData, node);
+    sd->create_time = monotonic_ms ();
+    sd->active_time = sd->create_time;
+
     hev_list_add_tail (&session_set, node);
     session_count++;
 
@@ -149,7 +180,11 @@ hev_socks5_tunnel_delete_session (HevListNode *node)
 void
 hev_socks5_tunnel_update_session (HevListNode *node)
 {
+    HevSocks5SessionData *sd;
     int max_session_count;
+
+    sd = container_of (node, HevSocks5SessionData, node);
+    sd->active_time = monotonic_ms ();
 
     max_session_count = hev_config_get_misc_max_session_count ();
     if (!max_session_count)
@@ -280,6 +315,69 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 }
 
 static void
+relieve_sessions (const HevSocks5TunnelRelief *relief)
+{
+    int64_t now = monotonic_ms ();
+    int udp = 0, tcp = 0, total = 0;
+    HevListNode *node;
+
+    /* The list is in insertion order, so max_count picks the oldest. */
+    node = hev_list_first (&session_set);
+    for (; node; node = hev_list_node_next (node)) {
+        HevSocks5SessionData *sd;
+        int type;
+
+        sd = container_of (node, HevSocks5SessionData, node);
+        total++;
+
+        if (HEV_OBJECT (sd->self)->klass == HEV_SOCKS5_SESSION_UDP_TYPE)
+            type = HEV_SOCKS5_TUNNEL_RELIEF_UDP;
+        else
+            type = HEV_SOCKS5_TUNNEL_RELIEF_TCP;
+
+        if (!(relief->types & type))
+            continue;
+        if (now - sd->active_time < relief->idle_ms)
+            continue;
+        if (relief->max_count && (udp + tcp) >= relief->max_count)
+            continue;
+
+        /* Only marks the session; it leaves the list when its task runs. */
+        hev_socks5_session_terminate (sd->self);
+        if (type == HEV_SOCKS5_TUNNEL_RELIEF_UDP)
+            udp++;
+        else
+            tcp++;
+    }
+
+    LOG_W ("socks5 tunnel relieve types %d idle %d max %d: udp %d tcp %d of %d",
+           relief->types, relief->idle_ms, relief->max_count, udp, tcp,
+           total);
+}
+
+static void
+relief_task_entry (void *data)
+{
+    LOG_D ("socks5 tunnel relief task run");
+
+    hev_task_add_fd (task_relief, relief_fds[0], POLLIN);
+
+    for (;;) {
+        HevSocks5TunnelRelief relief;
+        ssize_t res;
+
+        res = hev_task_io_read (relief_fds[0], &relief, sizeof (relief),
+                                task_io_yielder, NULL);
+        if (res != sizeof (relief))
+            break;
+
+        relieve_sessions (&relief);
+    }
+
+    hev_task_del_fd (task_relief, relief_fds[0]);
+}
+
+static void
 event_task_entry (void *data)
 {
     HevListNode *node;
@@ -293,6 +391,7 @@ event_task_entry (void *data)
 
     WRITE_ONCE (run, 0);
     atomic_fetch_and (&tsync, ~SYNC_SENT);
+    hev_task_wakeup (task_relief);
 
     node = hev_list_first (&session_set);
     for (; node; node = hev_list_node_next (node)) {
@@ -304,6 +403,7 @@ event_task_entry (void *data)
 
     hev_task_join (task_lwip_io);
     hev_task_join (task_lwip_timer);
+    hev_task_join (task_relief);
     hev_task_del_fd (task_event, event_fds[0]);
 }
 
@@ -572,6 +672,57 @@ event_task_fini (void)
 }
 
 static int
+relief_task_init (void)
+{
+    int nonblock = 1;
+    int res;
+
+    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, relief_fds);
+    if (res < 0) {
+        LOG_E ("socks5 tunnel relief");
+        return -1;
+    }
+
+    res = ioctl (relief_fds[0], FIONBIO, (char *)&nonblock);
+    if (res < 0) {
+        LOG_E ("socks5 tunnel relief nonblock");
+        return -1;
+    }
+
+    res = ioctl (relief_fds[1], FIONBIO, (char *)&nonblock);
+    if (res < 0) {
+        LOG_E ("socks5 tunnel relief nonblock");
+        return -1;
+    }
+
+    task_relief = hev_task_new (-1);
+    if (!task_relief) {
+        LOG_E ("socks5 tunnel task relief");
+        return -1;
+    }
+
+    return 0;
+}
+
+static void
+relief_task_fini (void)
+{
+    if (task_relief) {
+        hev_task_unref (task_relief);
+        task_relief = NULL;
+    }
+
+    if (relief_fds[0] >= 0) {
+        close (relief_fds[0]);
+        relief_fds[0] = -1;
+    }
+    if (relief_fds[1] >= 0) {
+        close (relief_fds[1]);
+        relief_fds[1] = -1;
+    }
+}
+
+static int
 lwip_io_task_init (void)
 {
     task_lwip_io = hev_task_new (-1);
@@ -670,6 +821,10 @@ hev_socks5_tunnel_init (int tun_fd)
     if (res < 0)
         goto exit;
 
+    res = relief_task_init ();
+    if (res < 0)
+        goto exit;
+
     res = lwip_io_task_init ();
     if (res < 0)
         goto exit;
@@ -709,6 +864,7 @@ retry:
     mapped_dns_fini ();
     lwip_timer_task_fini ();
     lwip_io_task_fini ();
+    relief_task_fini ();
     event_task_fini ();
     gateway_fini ();
     tunnel_fini ();
@@ -735,6 +891,9 @@ hev_socks5_tunnel_run (void)
 
     task_lwip_timer = hev_task_ref (task_lwip_timer);
     hev_task_run (task_lwip_timer, lwip_timer_task_entry, NULL);
+
+    task_relief = hev_task_ref (task_relief);
+    hev_task_run (task_relief, relief_task_entry, NULL);
 
     WRITE_ONCE (run, 1);
     hev_task_system_run ();
@@ -767,6 +926,24 @@ retry:
     }
 
     atomic_fetch_and (&tsync, ~SYNC_WAIT);
+}
+
+int
+hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
+{
+    HevSocks5TunnelRelief relief = { types, idle_ms, max_count };
+    ssize_t res;
+    int fd;
+
+    fd = READ_ONCE (relief_fds[1]);
+    if (fd < 0)
+        return -1;
+
+    res = write (fd, &relief, sizeof (relief));
+    if (res != sizeof (relief))
+        return -1;
+
+    return 0;
 }
 
 void
