@@ -250,6 +250,28 @@ int hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
 int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
 
 /**
+ * hev_socks5_tunnel_set_dns_priority:
+ * @max_sessions: size of the DNS pool, 0 turns DNS priority off, negative to
+ *            restore misc.dns-priority-sessions
+ * @timeout_ms: read-write timeout of a DNS session, zero or negative to
+ *            restore misc.dns-priority-timeout (5000 if not set)
+ * @addresses: comma separated IPv4 resolver addresses, at most 4; "" for any
+ *            address, NULL to restore misc.dns-priority-addresses
+ *
+ * New UDP flows to port 53 of these addresses go to a pool of their own: the
+ * memory probe and the UDP cap do not apply to them, and they do not count
+ * against the UDP cap. A full pool makes room by closing an answered session,
+ * or one older than a second without a reply; if all are younger and
+ * unanswered the new query is dropped. Live sessions keep the timeout they
+ * started with. Every tunnel start applies the configured values again. Safe
+ * to call from any thread.
+ *
+ * Returns: zero, or -1 for an invalid address list.
+ */
+int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
+                                        const char *addresses);
+
+/**
  * HevSocks5TunnelSessionStats:
  * @size: set by the caller to sizeof (HevSocks5TunnelSessionStats)
  * @udp_live, @tcp_live: live sessions
@@ -267,6 +289,12 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * @udp_queue_dropped: datagrams dropped because a UDP queue was full
  * @probe_hold_ms, @probe_closed_ms: time the memory probe has kept
  *            HEV_SOCKS5_TUNNEL_ADMIT_HOLD and HEV_SOCKS5_TUNNEL_ADMIT_CLOSED
+ * @dns_live, @dns_cap: live sessions in the DNS pool and its size, 0 if off
+ * @dns_created, @dns_evicted, @dns_refused: DNS pool sessions created,
+ *            closed to make room, and queries dropped with the pool full
+ *
+ * A caller built without the dns_* fields passes the smaller size and gets
+ * the fields it knows.
  */
 typedef struct
 {
@@ -287,6 +315,9 @@ typedef struct
     unsigned long long udp_refused_adm, tcp_refused_adm;
     unsigned long long udp_queue_dropped;
     unsigned long long probe_hold_ms, probe_closed_ms;
+    int dns_live;
+    int dns_cap;
+    unsigned long long dns_created, dns_evicted, dns_refused;
 } HevSocks5TunnelSessionStats;
 
 /**

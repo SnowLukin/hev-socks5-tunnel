@@ -33,6 +33,8 @@ struct _HevSocks5SessionData
     int type;
     int dying;
     int answered;
+    /* Replaces the UDP read-write timeout after the handshake if > 0. */
+    int timeout;
 };
 
 struct _HevSocks5SessionIface

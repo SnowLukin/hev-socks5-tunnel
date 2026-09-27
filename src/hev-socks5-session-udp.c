@@ -340,6 +340,9 @@ hev_socks5_session_udp_splice (HevSocks5Session *base)
 
     LOG_D ("%p socks5 session udp splice", self);
 
+    if (self->data.timeout > 0)
+        hev_socks5_set_timeout (HEV_SOCKS5 (self), self->data.timeout);
+
     num = hev_config_get_misc_udp_copy_buffer_nums ();
     fd = hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self));
     if (hev_task_mod_fd (task, fd, POLLIN | POLLOUT) < 0)

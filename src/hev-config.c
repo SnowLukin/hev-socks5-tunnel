@@ -50,6 +50,9 @@ static int connect_timeout;
 static int tcp_read_write_timeout;
 static int udp_read_write_timeout;
 static int limit_nofile;
+static int dns_priority_sessions;
+static int dns_priority_timeout;
+static char dns_priority_addresses[256];
 static int udp_max_sessions;
 static int tcp_max_sessions;
 static int udp_evict_min_idle;
@@ -413,6 +416,14 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             log_level = hev_config_parse_log_level (value);
         else if (0 == strcmp (key, "limit-nofile"))
             limit_nofile = strtol (value, NULL, 10);
+        else if (0 == strcmp (key, "dns-priority-sessions"))
+            dns_priority_sessions = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "dns-priority-timeout"))
+            dns_priority_timeout =
+                hev_config_parse_misc_count (key, value, 5000);
+        else if (0 == strcmp (key, "dns-priority-addresses"))
+            strncpy (dns_priority_addresses, value,
+                     sizeof (dns_priority_addresses) - 1);
         else if (0 == strcmp (key, "udp-max-sessions"))
             udp_max_sessions = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "tcp-max-sessions"))
@@ -553,6 +564,9 @@ hev_config_reset (void)
     udp_protect_idle = 0;
     tcp_protect_age = 0;
     tcp_protect_idle = 0;
+    dns_priority_sessions = 0;
+    dns_priority_timeout = 5000;
+    dns_priority_addresses[0] = '\0';
     log_level = HEV_LOGGER_WARN;
 }
 
@@ -780,6 +794,24 @@ int
 hev_config_get_misc_limit_nofile (void)
 {
     return limit_nofile;
+}
+
+int
+hev_config_get_misc_dns_priority_sessions (void)
+{
+    return dns_priority_sessions;
+}
+
+int
+hev_config_get_misc_dns_priority_timeout (void)
+{
+    return dns_priority_timeout;
+}
+
+const char *
+hev_config_get_misc_dns_priority_addresses (void)
+{
+    return dns_priority_addresses;
 }
 
 int
