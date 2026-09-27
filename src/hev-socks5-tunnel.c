@@ -127,6 +127,8 @@ static int dns_priority_cap;
 static int dns_priority_timeout_ms;
 static int dns_priority_addr_count;
 static uint32_t dns_priority_addr[DNS_PRIORITY_ADDRS];
+/* Queries that found the pool full and started as ordinary UDP sessions. */
+static uint64_t stat_dns_overflow;
 
 typedef struct _HevSocks5TunnelProbe HevSocks5TunnelProbe;
 
@@ -478,8 +480,11 @@ refuse:
  * a storm of new flows a lookup would otherwise lose to the storm, and every
  * new connection of the user fails before it starts. A full pool gives up an
  * answered session first, then one that waited longer than a resolver waits
- * for a reply. While all are young and unanswered the new query is refused:
- * evicting them would let a flood of queries kill each one before its reply.
+ * for a reply. While all are young and unanswered the new query does not get
+ * in: evicting them would let a flood of queries kill each one before its
+ * reply. It then takes the ordinary UDP path, so a burst of lookups larger
+ * than the pool, as when the tunnel starts, is limited by the UDP cap and the
+ * memory probe and not dropped while there is room.
  */
 static int
 session_admit_dns (void)
@@ -774,7 +779,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevMappedDNS *dns;
     int stack_size;
     HevTask *task;
-    int type, res;
+    int type, overflow;
 
     if (!READ_ONCE (run)) {
         udp_refuse (pcb);
@@ -799,14 +804,15 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
 
     /* Admission may evict a session, so it goes after the allocation. */
+    type = SESSION_UDP;
+    overflow = 0;
     if (dns_priority_match (addr, port)) {
-        type = SESSION_DNS;
-        res = session_admit_dns ();
-    } else {
-        type = SESSION_UDP;
-        res = session_admit (SESSION_UDP);
+        if (session_admit_dns () == 0)
+            type = SESSION_DNS;
+        else
+            overflow = 1;
     }
-    if (res < 0) {
+    if (type == SESSION_UDP && session_admit (SESSION_UDP) < 0) {
         hev_task_unref (task);
         udp_refuse (pcb);
         return;
@@ -822,6 +828,8 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
     hev_socks5_tunnel_insert_session (node, type);
+    if (overflow)
+        stat_inc (&stat_dns_overflow);
     hev_task_run (task, hev_socks5_session_task_entry, udp);
     hev_task_wakeup (task_lwip_timer);
 }
@@ -1366,6 +1374,7 @@ session_limits_init (void)
     __atomic_store_n (&probe_last_kb, -1, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
     memset (young_ring, 0, sizeof (young_ring));
+    __atomic_store_n (&stat_dns_overflow, 0, __ATOMIC_RELAXED);
 
     n = dns_priority_parse (hev_config_get_misc_dns_priority_addresses (),
                             addrs);
@@ -1753,8 +1762,9 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
                                      __ATOMIC_RELAXED);
     s.dns_refused = __atomic_load_n (&stat_refused[SESSION_DNS],
                                      __ATOMIC_RELAXED);
+    s.dns_overflow = __atomic_load_n (&stat_dns_overflow, __ATOMIC_RELAXED);
 
-    /* A caller built against the struct without the DNS fields gets the rest. */
+    /* A caller built against an older, shorter struct gets the fields it knows. */
     s.size = stats->size < sizeof (s) ? stats->size : sizeof (s);
     memcpy (stats, &s, s.size);
 

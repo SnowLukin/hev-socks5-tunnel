@@ -262,9 +262,10 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * memory probe and the UDP cap do not apply to them, and they do not count
  * against the UDP cap. A full pool makes room by closing an answered session,
  * or one older than a second without a reply; if all are younger and
- * unanswered the new query is dropped. Live sessions keep the timeout they
- * started with. Every tunnel start applies the configured values again. Safe
- * to call from any thread.
+ * unanswered the new query takes the ordinary UDP path, where the UDP cap and
+ * the memory probe apply. Live sessions keep the timeout they started with.
+ * Every tunnel start applies the configured values again. Safe to call from
+ * any thread.
  *
  * Returns: zero, or -1 for an invalid address list.
  */
@@ -291,10 +292,13 @@ int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
  *            HEV_SOCKS5_TUNNEL_ADMIT_HOLD and HEV_SOCKS5_TUNNEL_ADMIT_CLOSED
  * @dns_live, @dns_cap: live sessions in the DNS pool and its size, 0 if off
  * @dns_created, @dns_evicted, @dns_refused: DNS pool sessions created,
- *            closed to make room, and queries dropped with the pool full
+ *            closed to make room, and queries that found the pool full of
+ *            young unanswered sessions
+ * @dns_overflow: part of @dns_refused that started as ordinary UDP sessions;
+ *            the rest was refused by the UDP cap or the memory probe
  *
- * A caller built without the dns_* fields passes the smaller size and gets
- * the fields it knows.
+ * A caller built against an older, shorter struct passes the smaller size and
+ * gets the fields it knows.
  */
 typedef struct
 {
@@ -318,6 +322,7 @@ typedef struct
     int dns_live;
     int dns_cap;
     unsigned long long dns_created, dns_evicted, dns_refused;
+    unsigned long long dns_overflow;
 } HevSocks5TunnelSessionStats;
 
 /**
