@@ -67,7 +67,7 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
     HevListNode *node;
     HevSocks5UDP *udp;
     struct pbuf *buf;
-    int res;
+    int res, error;
 
     for (;;) {
         node = hev_list_first (&self->frame_list);
@@ -92,6 +92,7 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
 
     udp = HEV_SOCKS5_UDP (self);
     res = hev_socks5_udp_sendto (udp, buf->payload, buf->len, &frame->addr);
+    error = errno;
     hev_list_del (&self->frame_list, node);
     hev_free (frame);
     pbuf_free (buf);
@@ -104,11 +105,15 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
                 return 0;
             }
         }
-        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
-                                res == 0 ? "zero-write" : "send-failed", 0);
-        if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP)
+        if (res < -1)
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send", NULL, error);
+        if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP) {
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
+                                    res == 0 ? "zero-write" : NULL,
+                                    res < 0 ? error : 0);
             hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
-        res = -1;
+        }
+        HEV_SOCKS5 (self)->timed_out = 0;
     }
 
     self->alive |= HEV_SOCKS5_SESSION_UDP_ALIVE_F;
@@ -125,7 +130,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
     struct pbuf *buf;
     ip_addr_t saddr;
     uint16_t port;
-    int res;
+    int res, error;
 
     buf = pbuf_alloc (PBUF_TRANSPORT, UDP_BUF_SIZE, PBUF_RAM);
     if (!buf) {
@@ -135,6 +140,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
     }
 
     res = hev_socks5_udp_recvfrom (udp, buf->payload, buf->len, &addr);
+    error = errno;
     if (res <= 0) {
         if (res < -1) {
             self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_B;
@@ -145,8 +151,12 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
             }
         }
         hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-receive",
-                                res == 0 ? "proxy-closed-association" :
-                                           "receive-failed", 0);
+                                res == 0 ? (HEV_SOCKS5 (self)->type ==
+                                                    HEV_SOCKS5_TYPE_UDP_IN_TCP ?
+                                                "proxy-closed-association" :
+                                                "invalid-packet-length") :
+                                           NULL,
+                                res < 0 ? error : 0);
         if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP)
             hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
         pbuf_free (buf);
@@ -282,6 +292,7 @@ splice_task_entry (void *data)
     fd = hev_task_io_dup (hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self)));
     if (fd < 0) {
         hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-dup", NULL, errno);
+        self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_B;
         return;
     }
 
