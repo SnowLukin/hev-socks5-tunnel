@@ -11,9 +11,11 @@
 #define __HEV_UTILS_H__
 
 #include <lwip/ip_addr.h>
+#include <lwip/err.h>
 #include <hev-socks5-proto.h>
 
 void run_as_daemon (const char *pid_file);
+const char *hev_lwip_error_string (err_t error);
 int set_limit_nofile (int limit_nofile);
 int set_sock_mark (int fd, unsigned int mark);
 

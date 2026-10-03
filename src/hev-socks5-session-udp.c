@@ -48,6 +48,10 @@ task_io_yielder (HevTaskYieldType type, void *data)
 
         res = recv (self->fd, &buf, sizeof (buf), 0);
         if ((res == 0) || ((res < 0) && (errno != EAGAIN))) {
+            int error = errno;
+            hev_socks5_log_failure (self, "udp-control",
+                                    res < 0 ? NULL : "proxy-closed-association",
+                                    res < 0 ? error : 0);
             hev_socks5_set_timeout (self, 0);
             return -1;
         }
@@ -73,8 +77,12 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
         res = task_io_yielder (HEV_TASK_WAITIO, self);
         if (res < 0) {
             self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_F;
-            if (self->alive && hev_socks5_get_timeout (HEV_SOCKS5 (self)))
+            if (self->alive && hev_socks5_get_timeout (HEV_SOCKS5 (self))) {
+                HEV_SOCKS5 (self)->timed_out = 0;
                 return 0;
+            }
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-transfer",
+                                    "transfer-stopped", 0);
             return -1;
         }
     }
@@ -91,12 +99,15 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
     if (res <= 0) {
         if (res < -1) {
             self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_F;
-            if (self->alive && hev_socks5_get_timeout (HEV_SOCKS5 (self)))
+            if (self->alive && hev_socks5_get_timeout (HEV_SOCKS5 (self))) {
+                HEV_SOCKS5 (self)->timed_out = 0;
                 return 0;
+            }
         }
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
+                                res == 0 ? "zero-write" : "send-failed", 0);
         if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP)
             hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
-        LOG_D ("%p socks5 session udp fwd f send", self);
         res = -1;
     }
 
@@ -118,7 +129,8 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
 
     buf = pbuf_alloc (PBUF_TRANSPORT, UDP_BUF_SIZE, PBUF_RAM);
     if (!buf) {
-        LOG_D ("%p socks5 session udp fwd b buf", self);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-buffer",
+                                "out-of-memory", 0);
         return -1;
     }
 
@@ -127,13 +139,16 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
         if (res < -1) {
             self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_B;
             if (self->alive && hev_socks5_get_timeout (HEV_SOCKS5 (self))) {
+                HEV_SOCKS5 (self)->timed_out = 0;
                 pbuf_free (buf);
                 return 0;
             }
         }
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-receive",
+                                res == 0 ? "proxy-closed-association" :
+                                           "receive-failed", 0);
         if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP)
             hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
-        LOG_D ("%p socks5 session udp fwd b recv", self);
         pbuf_free (buf);
         return -1;
     }
@@ -147,7 +162,8 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
     } else {
         res = hev_socks5_addr_into_lwip (&addr, &saddr, &port);
         if (res < 0) {
-            LOG_D ("%p socks5 session udp fwd b addr", self);
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-address",
+                                    "unsupported-reply-address", 0);
             pbuf_free (buf);
             return -1;
         }
@@ -159,7 +175,8 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
     pbuf_free (buf);
 
     if (err != ERR_OK) {
-        LOG_D ("%p socks5 session udp fwd b send", self);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-udp-send",
+                                hev_lwip_error_string (err), err);
         return -1;
     }
 
@@ -194,6 +211,12 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     frame->data = p;
     memset (&frame->node, 0, sizeof (frame->node));
     hev_socks5_addr_from_lwip (&frame->addr, &pcb->local_ip, pcb->local_port);
+
+    if (!HEV_SOCKS5 (self)->diagnostic_target[0]) {
+        char target[272];
+        if (hev_socks5_addr_into_str (&frame->addr, target, sizeof (target)))
+            hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), target);
+    }
 
     if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {
         self->addr = ip_2_ip4 (&pcb->local_ip)->addr;
@@ -257,8 +280,10 @@ splice_task_entry (void *data)
     int fd;
 
     fd = hev_task_io_dup (hev_socks5_udp_get_fd (HEV_SOCKS5_UDP (self)));
-    if (fd < 0)
+    if (fd < 0) {
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-dup", NULL, errno);
         return;
+    }
 
     if (hev_task_add_fd (task, fd, POLLIN) < 0)
         hev_task_mod_fd (task, fd, POLLIN);
