@@ -62,11 +62,16 @@ tcp_splice_f (HevSocks5SessionTCP *self)
 
     if (iovc) {
         ssize_t s = writev (HEV_SOCKS5 (self)->fd, iov, iovc);
+        int error = errno;
         if (0 >= s) {
-            if ((0 > s) && (EAGAIN == errno))
+            if ((0 > s) && (EAGAIN == error))
                 res = 0;
-            else
+            else {
+                hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-write",
+                                        s < 0 ? NULL : "zero-write",
+                                        s < 0 ? error : 0);
                 res = -1;
+            }
         } else {
             hev_task_mutex_lock (self->mutex);
             self->queue = pbuf_free_header (self->queue, s);
@@ -92,11 +97,16 @@ tcp_splice_b (HevSocks5SessionTCP *self)
     iovc = hev_ring_buffer_writing (self->buffer, iov);
     if (iovc) {
         ssize_t s = readv (HEV_SOCKS5 (self)->fd, iov, iovc);
+        int error = errno;
         if (0 >= s) {
-            if ((0 > s) && (EAGAIN == errno))
+            if ((0 > s) && (EAGAIN == error))
                 res = 0;
-            else
+            else {
+                if (s < 0)
+                    hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-read",
+                                            NULL, error);
                 res = -1;
+            }
         } else {
             hev_ring_buffer_write_finish (self->buffer, s);
         }
@@ -113,11 +123,23 @@ tcp_splice_b (HevSocks5SessionTCP *self)
             for (i = 0; i < iovc; i++) {
                 void *ptr = iov[i].iov_base;
                 size_t len = iov[i].iov_len;
-                err |= tcp_write (self->pcb, ptr, len, 0);
+                err_t result = tcp_write (self->pcb, ptr, len, 0);
+                if (result != ERR_OK)
+                    hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-write",
+                                            hev_lwip_error_string (result),
+                                            result);
+                err |= result;
                 s += len;
             }
             hev_ring_buffer_read_finish (self->buffer, s);
-            err |= tcp_output (self->pcb);
+            {
+                err_t result = tcp_output (self->pcb);
+                if (result != ERR_OK)
+                    hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-output",
+                                            hev_lwip_error_string (result),
+                                            result);
+                err |= result;
+            }
             res = 1;
         } else if (res < 0) {
             tcp_shutdown (self->pcb, 0, 1);
@@ -164,6 +186,8 @@ tcp_err_handler (void *arg, err_t err)
 {
     HevSocks5SessionTCP *self = arg;
 
+    hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-tcp",
+                            hev_lwip_error_string (err), err);
     self->pcb = NULL;
     hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));
 }
@@ -204,8 +228,11 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
 
     tcp_buffer_size = hev_config_get_misc_tcp_buffer_size ();
     self->buffer = hev_ring_buffer_alloca (tcp_buffer_size);
-    if (!self->buffer)
+    if (!self->buffer) {
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-buffer",
+                                "out-of-memory", 0);
         return;
+    }
 
     for (;;) {
         HevTaskYieldType type;
@@ -222,16 +249,22 @@ hev_socks5_session_tcp_splice (HevSocks5Session *base)
         else
             break;
 
-        if (task_io_yielder (type, base) < 0)
+        if (task_io_yielder (type, base) < 0) {
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-transfer",
+                                    "transfer-stopped", 0);
             break;
+        }
     }
 
     while (self->pcb) {
         if (hev_ring_buffer_get_use_size (self->buffer) == 0)
             break;
 
-        if (task_io_yielder (HEV_TASK_WAITIO, base) < 0)
+        if (task_io_yielder (HEV_TASK_WAITIO, base) < 0) {
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-drain",
+                                    "transfer-stopped", 0);
             break;
+        }
     }
 }
 
