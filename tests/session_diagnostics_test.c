@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <lwip/init.h>
+#include <lwip/netif.h>
 #include <hev-task-system.h>
 #include <hev-socks5-logger.h>
 #include "hev-main.h"
@@ -17,7 +19,8 @@ begin_history (void)
 {
     strcpy (history, "/tmp/hev-session-diagnostics.XXXXXX");
     assert (mkdtemp (history));
-    assert (!hev_socks5_tunnel_log_history_configure (history, "diagnostics", NULL));
+    assert (!hev_socks5_tunnel_log_history_configure (history, "diagnostics",
+                                                      NULL));
     assert (!hev_socks5_logger_init (HEV_SOCKS5_LOGGER_INFO, "stdout"));
 }
 
@@ -39,7 +42,8 @@ read_history (void)
         snprintf (path, sizeof (path), "%s/%s", history, entry->d_name);
         file = fopen (path, "r");
         assert (file);
-        length += fread (records + length, 1, sizeof (records) - length - 1, file);
+        length +=
+            fread (records + length, 1, sizeof (records) - length - 1, file);
         fclose (file);
     }
     closedir (directory);
@@ -57,7 +61,8 @@ new_session (HevTaskMutex *mutex)
     assert (tcp_bind (pcb, &address, 8443) == ERR_OK);
     session = hev_socks5_session_tcp_new (pcb, mutex);
     assert (session);
-    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (session), hev_task_self ());
+    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (session),
+                                 hev_task_self ());
     hev_socks5_set_timeout (HEV_SOCKS5 (session), 1000);
     return session;
 }
@@ -73,6 +78,118 @@ expect_failure (const char *operation, const char *reason)
     failure = strstr (records, "socks5 failure");
     assert (failure && !strstr (failure + 1, "socks5 failure"));
     assert (!strstr (records, "socks5 session tcp splice"));
+}
+
+static void
+expect_transfer_timeout (HevTaskMutex *mutex)
+{
+    HevSocks5SessionTCP *session;
+    int fd[2], flags;
+
+    begin_history ();
+    session = new_session (mutex);
+    assert (!socketpair (AF_UNIX, SOCK_STREAM, 0, fd));
+    HEV_SOCKS5 (session)->fd = fd[0];
+    flags = fcntl (fd[0], F_GETFL, 0);
+    assert (flags >= 0);
+    assert (!fcntl (fd[0], F_SETFL, flags | O_NONBLOCK));
+    hev_socks5_set_timeout (HEV_SOCKS5 (session), 1);
+    hev_socks5_session_tcp_splice (HEV_SOCKS5_SESSION (session));
+    expect_failure ("operation=tcp-transfer", "reason=timeout");
+    hev_object_unref (HEV_OBJECT (session));
+    close (fd[1]);
+}
+
+static void
+expect_closed_callback_is_quiet (HevTaskMutex *mutex)
+{
+    HevSocks5SessionTCP *session;
+
+    begin_history ();
+    session = new_session (mutex);
+    tcp_err (session->pcb, NULL);
+    tcp_abort (session->pcb);
+    tcp_err_handler (session, ERR_CLSD);
+    read_history ();
+    assert (!strstr (records, "socks5 failure"));
+    hev_object_unref (HEV_OBJECT (session));
+}
+
+static void
+expect_cancelled_transfer_is_quiet (HevTaskMutex *mutex)
+{
+    HevSocks5SessionTCP *session;
+    int fd[2], flags;
+
+    begin_history ();
+    session = new_session (mutex);
+    assert (!socketpair (AF_UNIX, SOCK_STREAM, 0, fd));
+    HEV_SOCKS5 (session)->fd = fd[0];
+    flags = fcntl (fd[0], F_GETFL, 0);
+    assert (flags >= 0);
+    assert (!fcntl (fd[0], F_SETFL, flags | O_NONBLOCK));
+    hev_socks5_session_terminate (HEV_SOCKS5_SESSION (session));
+    hev_socks5_session_tcp_splice (HEV_SOCKS5_SESSION (session));
+    read_history ();
+    assert (!strstr (records, "socks5 failure"));
+    hev_object_unref (HEV_OBJECT (session));
+    close (fd[1]);
+}
+
+static err_t
+accept_output (struct netif *netif, struct pbuf *packet,
+               const ip4_addr_t *address)
+{
+    (void)netif;
+    (void)packet;
+    (void)address;
+    return ERR_OK;
+}
+
+static err_t
+init_netif (struct netif *netif)
+{
+    netif->output = accept_output;
+    return ERR_OK;
+}
+
+static void
+expect_drain_timeout (HevTaskMutex *mutex)
+{
+    HevSocks5SessionTCP *session;
+    struct netif netif;
+    ip4_addr_t address, mask, gateway;
+    int fd[2];
+
+    IP4_ADDR (&address, 203, 0, 113, 1);
+    IP4_ADDR (&mask, 255, 255, 255, 0);
+    IP4_ADDR (&gateway, 203, 0, 113, 1);
+    memset (&netif, 0, sizeof (netif));
+    assert (
+        netif_add (&netif, &address, &mask, &gateway, NULL, init_netif, NULL));
+    netif_set_up (&netif);
+    netif_set_link_up (&netif);
+    netif_set_default (&netif);
+    begin_history ();
+    session = new_session (mutex);
+    assert (!socketpair (AF_UNIX, SOCK_STREAM, 0, fd));
+    HEV_SOCKS5 (session)->fd = fd[0];
+    {
+        ip_addr_t remote;
+        IP_ADDR4 (&remote, 203, 0, 113, 2);
+        assert (tcp_connect (session->pcb, &remote, 9443, NULL) == ERR_OK);
+    }
+    session->pcb->state = ESTABLISHED;
+    session->pcb->snd_wnd = 0;
+    session->pcb_eof = 1;
+    assert (write (fd[1], "x", 1) == 1);
+    assert (!shutdown (fd[1], SHUT_WR));
+    hev_socks5_set_timeout (HEV_SOCKS5 (session), 1);
+    hev_socks5_session_tcp_splice (HEV_SOCKS5_SESSION (session));
+    expect_failure ("operation=tcp-drain", "reason=timeout");
+    hev_object_unref (HEV_OBJECT (session));
+    close (fd[1]);
+    netif_remove (&netif);
 }
 
 static void
@@ -129,16 +246,25 @@ run (void *data)
     assert (!strstr (records, "socks5 failure"));
     hev_object_unref (HEV_OBJECT (session));
 
+    expect_transfer_timeout (&mutex);
+    expect_drain_timeout (&mutex);
+    expect_cancelled_transfer_is_quiet (&mutex);
+    expect_closed_callback_is_quiet (&mutex);
+
     assert (!strcmp (hev_lwip_error_string (ERR_TIMEOUT), "timeout"));
     assert (!strcmp (hev_lwip_error_string (ERR_RTE), "no-route"));
     assert (!strcmp (hev_lwip_error_string (-99), "unknown-lwip-error"));
-    puts ("PASS tunnel diagnostics: TCP reset, read/write errno, EOF, cancellation, JSONL history");
+    puts (
+        "PASS tunnel diagnostics: TCP reset, read/write errno, transfer/drain timeout, EOF, cancellation, graceful close, JSONL history");
 }
 
 int
 main (void)
 {
     HevTask *task;
+    static const unsigned char config[] =
+        "misc:\n  tcp-buffer-size: 64\n  max-session-count: 0\n";
+    assert (!hev_config_init_from_str (config, sizeof (config) - 1));
     lwip_init ();
     assert (!hev_task_system_init ());
     task = hev_task_new (65536);

@@ -103,8 +103,8 @@ tcp_splice_b (HevSocks5SessionTCP *self)
                 res = 0;
             else {
                 if (s < 0)
-                    hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-read",
-                                            NULL, error);
+                    hev_socks5_log_failure (HEV_SOCKS5 (self), "tcp-read", NULL,
+                                            error);
                 res = -1;
             }
         } else {
@@ -186,8 +186,9 @@ tcp_err_handler (void *arg, err_t err)
 {
     HevSocks5SessionTCP *self = arg;
 
-    hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-tcp",
-                            hev_lwip_error_string (err), err);
+    if (err != ERR_CLSD)
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-tcp",
+                                hev_lwip_error_string (err), err);
     self->pcb = NULL;
     hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));
 }

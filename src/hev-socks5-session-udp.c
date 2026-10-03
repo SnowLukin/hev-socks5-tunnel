@@ -94,8 +94,8 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self, unsigned int num)
 
     res = hev_socks5_udp_sendmmsg (HEV_SOCKS5_UDP (self), msgv, res);
     if (res <= 0) {
-        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
-                                "send-failed", 0);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send", "send-failed",
+                                0);
         return -1;
     }
 
@@ -129,9 +129,9 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
     if (res <= 0) {
         if (res == -1 && errno == EAGAIN)
             return 0;
-        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-receive",
-                                res == 0 ? "proxy-closed-association" :
-                                           "receive-failed", 0);
+        hev_socks5_log_failure (
+            HEV_SOCKS5 (self), "udp-receive",
+            res == 0 ? "proxy-closed-association" : "receive-failed", 0);
         return -1;
     }
 
