@@ -143,7 +143,7 @@ $(EXEC_TARGET) : $(LDOBJS) tp-static
 
 $(STATIC_TARGET) : $(LDOBJS) tp-static
 	$(ECHO_PREFIX) mkdir -p $(dir $@)
-	$(ECHO_PREFIX) $(AR) csq $@ $(LDOBJS)
+	$(ECHO_PREFIX) $(AR) rcs $@ $(LDOBJS)
 	@printf $(LINKMSG) $@
 
 $(SHARED_TARGET) : $(LDOBJS) tp-shared

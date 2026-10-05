@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -10,6 +11,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <lwip/init.h>
+#include <lwip/ip4.h>
+#include <lwip/inet_chksum.h>
+#include <lwip/netif.h>
 #include <hev-task-system.h>
 #include <hev-socks5-logger.h>
 #include "hev-main.h"
@@ -98,6 +102,79 @@ receive_frame (HevSocks5SessionUDP *session)
     memcpy (packet->payload, "dns", 3);
     IP_ADDR4 (&source, 192, 0, 2, 7);
     udp_recv_handler (session, session->pcb, packet, &source, 41000);
+}
+
+static err_t
+init_input_netif (struct netif *netif)
+{
+    (void)netif;
+    return ERR_OK;
+}
+
+static void
+receive_frame_through_ip4 (HevSocks5SessionUDP *session)
+{
+    unsigned char packet[] = {
+        0x45, 0, 0, 31, 0, 1, 0, 0, 64, 17, 0, 0,
+        192, 0, 2, 7, 203, 0, 113, 42,
+        0xa0, 0x28, 0x14, 0xe9, 0, 11, 0, 0, 'd', 'n', 's'
+    };
+    struct netif netif = { 0 };
+    struct pbuf *p;
+    ip4_addr_t address, mask, gateway;
+    uint16_t checksum;
+
+    IP4_ADDR (&address, 203, 0, 113, 42);
+    IP4_ADDR (&mask, 255, 255, 255, 0);
+    IP4_ADDR (&gateway, 203, 0, 113, 1);
+    assert (netif_add (&netif, &address, &mask, &gateway, NULL,
+                       init_input_netif, NULL));
+    netif_set_up (&netif);
+    netif_set_link_up (&netif);
+    checksum = inet_chksum (packet, 20);
+    memcpy (packet + 10, &checksum, sizeof (checksum));
+    p = pbuf_alloc (PBUF_RAW, sizeof (packet), PBUF_RAM);
+    assert (p);
+    assert (pbuf_take (p, packet, sizeof (packet)) == ERR_OK);
+    assert (ip4_input (p, &netif) == ERR_OK);
+    assert (session->frames == 1);
+    netif_remove (&netif);
+}
+
+static void
+expect_partial_tcp_frame_stops_receive (HevTaskMutex *mutex, int ending)
+{
+    HevSocks5SessionUDP *session;
+    int fd[2], flags;
+
+    begin_history ();
+    session = new_session (mutex);
+    HEV_SOCKS5 (session)->type = HEV_SOCKS5_TYPE_UDP_IN_TCP;
+    assert (!socketpair (AF_UNIX, SOCK_STREAM, 0, fd));
+    HEV_SOCKS5 (session)->fd = fd[0];
+    flags = fcntl (fd[0], F_GETFL, 0);
+    assert (flags >= 0);
+    assert (!fcntl (fd[0], F_SETFL, flags | O_NONBLOCK));
+    assert (!hev_task_add_fd (hev_task_self (), fd[0], POLLIN));
+    assert (write (fd[1], "x", 1) == 1);
+    if (ending == 0)
+        hev_socks5_set_timeout (HEV_SOCKS5 (session), 1);
+    else if (ending == 1)
+        assert (!shutdown (fd[1], SHUT_WR));
+    else
+        hev_socks5_session_terminate (HEV_SOCKS5_SESSION (session));
+
+    assert (hev_socks5_session_udp_fwd_b (session, 2) < 0);
+    if (ending == 2) {
+        read_history ();
+        assert (!strstr (records, "socks5 failure"));
+    } else {
+        expect_one_failure ("target=udp-association", "operation=udp-read",
+                            ending == 0 ? "reason=timeout" :
+                                          "reason=unexpected EOF");
+    }
+    hev_object_unref (HEV_OBJECT (session));
+    close (fd[1]);
 }
 
 typedef struct
@@ -239,7 +316,7 @@ run (void *data)
 
     begin_history ();
     session = new_session (&mutex);
-    receive_frame (session);
+    receive_frame_through_ip4 (session);
     receive_frame (session);
     assert (session->frames == 2);
     assert (!strcmp (HEV_SOCKS5 (session)->diagnostic_target,
@@ -249,6 +326,10 @@ run (void *data)
     assert (!strstr (records, "udp-receive"));
     assert (!strstr (records, "udp-send"));
     hev_object_unref (HEV_OBJECT (session));
+
+    expect_partial_tcp_frame_stops_receive (&mutex, 0);
+    expect_partial_tcp_frame_stops_receive (&mutex, 1);
+    expect_partial_tcp_frame_stops_receive (&mutex, 2);
 
     begin_history ();
     session = new_session (&mutex);

@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <lwip/init.h>
+#include <lwip/ip4.h>
+#include <lwip/inet_chksum.h>
 #include <lwip/netif.h>
 #include <hev-task-system.h>
 #include <hev-socks5-logger.h>
@@ -154,6 +156,56 @@ init_netif (struct netif *netif)
 }
 
 static void
+expect_rst_through_ip4 (HevTaskMutex *mutex)
+{
+    unsigned char packet[] = {
+        0x45, 0, 0, 40, 0, 1, 0, 0, 64, 6, 0, 0,
+        192, 0, 2, 7, 203, 0, 113, 10,
+        0xa0, 0x28, 0x20, 0xfb, 0, 0, 0, 1, 0, 0, 0, 0,
+        0x50, 0x04, 0, 0, 0, 0, 0, 0
+    };
+    HevSocks5SessionTCP *session;
+    struct netif netif = { 0 };
+    struct pbuf *p;
+    ip4_addr_t address, mask, gateway;
+    ip_addr_t source, destination;
+    uint16_t checksum;
+
+    IP4_ADDR (&address, 203, 0, 113, 10);
+    IP4_ADDR (&mask, 255, 255, 255, 0);
+    IP4_ADDR (&gateway, 203, 0, 113, 1);
+    assert (netif_add (&netif, &address, &mask, &gateway, NULL, init_netif,
+                       NULL));
+    netif_set_up (&netif);
+    netif_set_link_up (&netif);
+    netif_set_default (&netif);
+    begin_history ();
+    session = new_session (mutex);
+    IP_ADDR4 (&source, 192, 0, 2, 7);
+    IP_ADDR4 (&destination, 203, 0, 113, 10);
+    assert (tcp_connect (session->pcb, &source, 41000, NULL) == ERR_OK);
+    session->pcb->state = ESTABLISHED;
+    session->pcb->rcv_nxt = 1;
+
+    checksum = inet_chksum (packet, 20);
+    memcpy (packet + 10, &checksum, sizeof (checksum));
+    p = pbuf_alloc (PBUF_RAW, 20, PBUF_RAM);
+    assert (p);
+    assert (pbuf_take (p, packet + 20, 20) == ERR_OK);
+    checksum = ip_chksum_pseudo (p, IP_PROTO_TCP, 20, &source, &destination);
+    memcpy (packet + 36, &checksum, sizeof (checksum));
+    pbuf_free (p);
+    p = pbuf_alloc (PBUF_RAW, sizeof (packet), PBUF_RAM);
+    assert (p);
+    assert (pbuf_take (p, packet, sizeof (packet)) == ERR_OK);
+    assert (ip4_input (p, &netif) == ERR_OK);
+    assert (!session->pcb);
+    expect_failure ("operation=lwip-tcp", "reason=connection-reset code=-14");
+    hev_object_unref (HEV_OBJECT (session));
+    netif_remove (&netif);
+}
+
+static void
 expect_drain_timeout (HevTaskMutex *mutex)
 {
     HevSocks5SessionTCP *session;
@@ -247,6 +299,7 @@ run (void *data)
     hev_object_unref (HEV_OBJECT (session));
 
     expect_transfer_timeout (&mutex);
+    expect_rst_through_ip4 (&mutex);
     expect_drain_timeout (&mutex);
     expect_cancelled_transfer_is_quiet (&mutex);
     expect_closed_callback_is_quiet (&mutex);
