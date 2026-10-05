@@ -50,7 +50,7 @@ task_io_yielder (HevTaskYieldType type, void *data)
         if ((res == 0) || ((res < 0) && (errno != EAGAIN))) {
             int error = errno;
             hev_socks5_log_failure (self, "udp-control",
-                                    res < 0 ? NULL : "proxy-closed-association",
+                                    res < 0 ? NULL : "unexpected EOF",
                                     res < 0 ? error : 0);
             hev_socks5_set_timeout (self, 0);
             return -1;
@@ -97,6 +97,14 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
     hev_free (frame);
     pbuf_free (buf);
     self->frames--;
+    if (res <= 0 && HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP) {
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
+                                res == 0 ? "zero-write" : NULL,
+                                res < 0 ? error : 0);
+        self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_F;
+        hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
+        return -1;
+    }
     if (res <= 0) {
         if (res < -1) {
             self->alive &= ~HEV_SOCKS5_SESSION_UDP_ALIVE_F;
@@ -107,12 +115,6 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
         }
         if (res < -1)
             hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send", NULL, error);
-        if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP) {
-            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send",
-                                    res == 0 ? "zero-write" : NULL,
-                                    res < 0 ? error : 0);
-            hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
-        }
         HEV_SOCKS5 (self)->timed_out = 0;
     }
 
@@ -151,11 +153,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self)
             }
         }
         hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-receive",
-                                res == 0 ? (HEV_SOCKS5 (self)->type ==
-                                                    HEV_SOCKS5_TYPE_UDP_IN_TCP ?
-                                                "proxy-closed-association" :
-                                                "invalid-packet-length") :
-                                           NULL,
+                                res == 0 ? "empty-udp-payload" : NULL,
                                 res < 0 ? error : 0);
         if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP)
             hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);

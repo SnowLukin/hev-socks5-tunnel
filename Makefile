@@ -42,6 +42,7 @@ $(SHARED_TARGET) : LDFLAGS+=-shared -pthread
 
 -include build.mk
 CCFLAGS+=$(VERSION_CFLAGS)
+LWIP_SRCFILES=$(patsubst $(THIRDPARTDIR)/lwip/%,%,$(filter-out $(THIRDPARTDIR)/lwip/src/ports/unix/netif/pcapif.c,$(call rwildcard,$(THIRDPARTDIR)/lwip/src/,*.c *.S)))
 CCSRCS=$(filter %.c,$(SRCFILES))
 ASSRCS=$(filter %.S,$(SRCFILES))
 LDOBJS=$(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(CCSRCS)) \
@@ -95,10 +96,14 @@ static : $(STATIC_TARGET)
 shared : $(SHARED_TARGET)
 
 tp-static : $(THIRDPARTS)
-	@$(foreach dir,$^,$(MAKE) --no-print-directory -C $(dir) static;)
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/yaml static
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/lwip static SRCFILES='$(LWIP_SRCFILES)'
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/hev-task-system static
 
 tp-shared : $(THIRDPARTS)
-	@$(foreach dir,$^,$(MAKE) --no-print-directory -C $(dir) shared;)
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/yaml shared
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/lwip shared SRCFILES='$(LWIP_SRCFILES)'
+	@$(MAKE) --no-print-directory -C $(THIRDPARTDIR)/hev-task-system shared
 
 tp-clean : $(THIRDPARTS)
 	@$(foreach dir,$^,$(MAKE) --no-print-directory -C $(dir) clean;)
@@ -134,7 +139,7 @@ $(EXEC_TARGET) : $(LDOBJS) tp-static
 
 $(STATIC_TARGET) : $(LDOBJS) tp-static
 	$(ECHO_PREFIX) mkdir -p $(dir $@)
-	$(ECHO_PREFIX) $(AR) csq $@ $(LDOBJS)
+	$(ECHO_PREFIX) $(AR) rcs $@ $(LDOBJS)
 	@printf $(LINKMSG) $@
 
 $(SHARED_TARGET) : $(LDOBJS) tp-shared
