@@ -11,6 +11,7 @@
 #define __HEV_MAIN_H__
 
 #include <stddef.h>
+#include "hev-socks5-log-history.h"
 
 #ifdef __cplusplus
 extern "C" {

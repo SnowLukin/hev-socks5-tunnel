@@ -14,10 +14,13 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <string.h>
 
 #include "hev-main.h"
+#include "hev-socks5-log-history.h"
 
 #include "hev-jni.h"
 
@@ -52,13 +55,139 @@ static void native_start_service (JNIEnv *env, jobject thiz, jstring conig_path,
                                   jint fd);
 static void native_stop_service (JNIEnv *env, jobject thiz);
 static jlongArray native_get_stats (JNIEnv *env, jobject thiz);
+static void native_configure_log_history (JNIEnv *env, jobject thiz, jstring json);
+static jstring native_get_log_history_state (JNIEnv *env, jobject thiz);
 
 static JNINativeMethod native_methods[] = {
     { "TProxyStartService", "(Ljava/lang/String;I)V",
       (void *)native_start_service },
     { "TProxyStopService", "()V", (void *)native_stop_service },
     { "TProxyGetStats", "()[J", (void *)native_get_stats },
+    { "ConfigureLogHistory", "(Ljava/lang/String;)V",
+      (void *)native_configure_log_history },
+    { "GetLogHistoryState", "()Ljava/lang/String;",
+      (void *)native_get_log_history_state },
 };
+
+static int
+json_string_value (const char *json, const char *key, char *value, size_t value_size)
+{
+    const char *cursor;
+    size_t length = 0;
+
+    cursor = strstr (json, key);
+    if (!cursor)
+        return 0;
+    cursor = strchr (cursor + strlen (key), ':');
+    if (!cursor)
+        return -1;
+    cursor++;
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r')
+        cursor++;
+    if (*cursor != '"')
+        return -1;
+    cursor++;
+    while (*cursor && *cursor != '"') {
+        char c = *cursor++;
+
+        if (c == '\\') {
+            c = *cursor++;
+            if (!c)
+                return -1;
+            switch (c) {
+            case '"':
+            case '\\':
+            case '/':
+                break;
+            case 'b':
+                c = '\b';
+                break;
+            case 'f':
+                c = '\f';
+                break;
+            case 'n':
+                c = '\n';
+                break;
+            case 'r':
+                c = '\r';
+                break;
+            case 't':
+                c = '\t';
+                break;
+            default:
+                return -1;
+            }
+        }
+        if (c == '\0' || length + 1 >= value_size)
+            return -1;
+        value[length++] = c;
+    }
+    if (*cursor != '"')
+        return -1;
+    value[length] = '\0';
+    return 1;
+}
+
+static int
+json_size_value (const char *json, const char *key, size_t *value)
+{
+    const char *cursor;
+    char *end;
+    unsigned long long parsed;
+
+    cursor = strstr (json, key);
+    if (!cursor)
+        return 0;
+    cursor = strchr (cursor + strlen (key), ':');
+    if (!cursor)
+        return -1;
+    errno = 0;
+    parsed = strtoull (cursor + 1, &end, 10);
+    if (errno || end == cursor + 1 || parsed > SIZE_MAX)
+        return -1;
+    *value = (size_t)parsed;
+    return 1;
+}
+
+static int
+configure_log_history_json (const char *json)
+{
+    HevSocks5LogHistoryPolicy policy;
+    char directory[1025];
+    char connection_id[513];
+    int value;
+
+    if (!json || !*json || 0 == strcmp (json, "null"))
+        return hev_socks5_tunnel_log_history_configure (NULL, NULL, NULL);
+
+    value = json_string_value (json, "\"directory\"", directory, sizeof (directory));
+    if (value != 1 || directory[0] != '/')
+        return -1;
+    value = json_string_value (json, "\"connectionId\"", connection_id, sizeof (connection_id));
+    if (value < 0)
+        return -1;
+    if (value == 0)
+        connection_id[0] = '\0';
+
+    policy.max_segment_bytes = 2u * 1024u * 1024u;
+    policy.max_source_bytes = 8u * 1024u * 1024u;
+    policy.max_segments = 4u;
+    value = json_size_value (json, "\"maxSegmentBytes\"", &policy.max_segment_bytes);
+    if (value < 0)
+        return -1;
+    value = json_size_value (json, "\"maxSourceBytes\"", &policy.max_source_bytes);
+    if (value < 0)
+        return -1;
+    {
+        size_t max_segments = policy.max_segments;
+        value = json_size_value (json, "\"maxSegments\"", &max_segments);
+        if (value < 0 || max_segments > UINT_MAX)
+            return -1;
+        policy.max_segments = (unsigned int)max_segments;
+    }
+    return hev_socks5_tunnel_log_history_configure (
+        directory, connection_id[0] ? connection_id : NULL, &policy);
+}
 
 static void
 detach_current_thread (void *env)
@@ -146,6 +275,31 @@ native_stop_service (JNIEnv *env, jobject thiz)
     is_working = 0;
 exit:
     pthread_mutex_unlock (&mutex);
+}
+
+static void
+native_configure_log_history (JNIEnv *env, jobject thiz, jstring json)
+{
+    const char *value = NULL;
+
+    if (json)
+        value = (*env)->GetStringUTFChars (env, json, NULL);
+    pthread_mutex_lock (&mutex);
+    if (!is_working || !value || !*value || 0 == strcmp (value, "null"))
+        configure_log_history_json (value);
+    pthread_mutex_unlock (&mutex);
+    if (value)
+        (*env)->ReleaseStringUTFChars (env, json, value);
+}
+
+static jstring
+native_get_log_history_state (JNIEnv *env, jobject thiz)
+{
+    char state[4096];
+
+    if (hev_socks5_tunnel_log_history_state (state, sizeof (state)) < 0)
+        return (*env)->NewStringUTF (env, "{\"v\":1,\"status\":\"closed\"}");
+    return (*env)->NewStringUTF (env, state);
 }
 
 static jlongArray
