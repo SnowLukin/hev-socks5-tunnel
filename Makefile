@@ -81,6 +81,16 @@ endif
 
 exec : $(EXEC_TARGET)
 
+test-diagnostics : static
+	@tmp=$$(mktemp /tmp/hev-session-diagnostics.XXXXXX); \
+	$(CC) -g -O1 -Wall -Werror $(CCFLAGS) \
+		tests/session_diagnostics_test.c $(STATIC_TARGET) $(LDFLAGS) \
+		-o $$tmp && $$tmp; result=$$?; rm -f $$tmp; exit $$result
+	@tmp=$$(mktemp /tmp/hev-udp-diagnostics.XXXXXX); \
+	$(CC) -g -O1 -Wall -Werror $(CCFLAGS) \
+		tests/udp_session_diagnostics_test.c $(STATIC_TARGET) $(LDFLAGS) \
+		-o $$tmp && $$tmp; result=$$?; rm -f $$tmp; exit $$result
+
 test-log-history:
 	@tmp=$$(mktemp /tmp/hev-log-history.XXXXXX); \
 	$(CC) -std=c11 -D_DARWIN_C_SOURCE -Wall -Werror -pthread \
@@ -133,7 +143,7 @@ $(EXEC_TARGET) : $(LDOBJS) tp-static
 
 $(STATIC_TARGET) : $(LDOBJS) tp-static
 	$(ECHO_PREFIX) mkdir -p $(dir $@)
-	$(ECHO_PREFIX) $(AR) csq $@ $(LDOBJS)
+	$(ECHO_PREFIX) $(AR) rcs $@ $(LDOBJS)
 	@printf $(LINKMSG) $@
 
 $(SHARED_TARGET) : $(LDOBJS) tp-shared

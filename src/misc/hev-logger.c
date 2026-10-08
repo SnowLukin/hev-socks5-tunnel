@@ -135,7 +135,8 @@ hev_logger_log (HevLoggerLevel level, const char *fmt, ...)
     iov[2].iov_len = len;
 
     if (history_writer) {
-        static const char *history_levels[] = { "debug", "info", "warning", "error", "unknown" };
+        static const char *history_levels[] = { "debug", "info", "warning",
+                                                "error", "unknown" };
         hev_socks5_log_history_write (history_levels[level], msg);
         return;
     }

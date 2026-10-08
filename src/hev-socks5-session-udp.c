@@ -51,6 +51,10 @@ task_io_yielder (HevTaskYieldType type, void *data)
 
         res = recv (self->fd, &buf, sizeof (buf), 0);
         if ((res == 0) || ((res < 0) && (errno != EAGAIN))) {
+            int error = errno;
+            hev_socks5_log_failure (self, "udp-control",
+                                    res < 0 ? NULL : "proxy-closed-association",
+                                    res < 0 ? error : 0);
             hev_socks5_set_timeout (self, 0);
             return -1;
         }
@@ -90,7 +94,8 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self, unsigned int num)
 
     res = hev_socks5_udp_sendmmsg (HEV_SOCKS5_UDP (self), msgv, res);
     if (res <= 0) {
-        LOG_D ("%p socks5 session udp fwd f send", self);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-send", "send-failed",
+                                0);
         return -1;
     }
 
@@ -124,7 +129,9 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
     if (res <= 0) {
         if (res == -1 && errno == EAGAIN)
             return 0;
-        LOG_D ("%p socks5 session udp fwd b recv", self);
+        hev_socks5_log_failure (
+            HEV_SOCKS5 (self), "udp-receive",
+            res == 0 ? "proxy-closed-association" : "receive-failed", 0);
         return -1;
     }
 
@@ -145,14 +152,16 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
         } else {
             ret = hev_socks5_addr_into_lwip (msgv[i].addr, &saddr, &port);
             if (ret < 0) {
-                LOG_D ("%p socks5 session udp fwd b addr", self);
+                hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-address",
+                                        "unsupported-reply-address", 0);
                 return -1;
             }
         }
 
         b = pbuf_alloc_reference (msgv[i].buf, msgv[i].len, PBUF_REF);
         if (!b) {
-            LOG_D ("%p socks5 session udp fwd b buf", self);
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-buffer",
+                                    "out-of-memory", 0);
             return -1;
         }
 
@@ -162,7 +171,8 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
 
         pbuf_free (b);
         if (err != ERR_OK) {
-            LOG_D ("%p socks5 session udp fwd b send", self);
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "lwip-udp-send",
+                                    hev_lwip_error_string (err), err);
             return -1;
         }
     }
@@ -196,6 +206,12 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     frame->data = p;
     memset (&frame->node, 0, sizeof (frame->node));
     hev_socks5_addr_from_lwip (&frame->addr, &pcb->local_ip, pcb->local_port);
+
+    if (!HEV_SOCKS5 (self)->diagnostic_target[0]) {
+        char target[272];
+        if (hev_socks5_addr_into_str (&frame->addr, target, sizeof (target)))
+            hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), target);
+    }
 
     if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {
         self->addr = ip_2_ip4 (&pcb->local_ip)->addr;
@@ -294,8 +310,11 @@ hev_socks5_session_udp_splice (HevSocks5Session *base)
         else
             break;
 
-        if (task_io_yielder (type, self))
+        if (task_io_yielder (type, self)) {
+            hev_socks5_log_failure (HEV_SOCKS5 (self), "udp-transfer",
+                                    "transfer-stopped", 0);
             break;
+        }
     }
 }
 
