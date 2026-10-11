@@ -30,7 +30,8 @@ hev_socks5_session_run (HevSocks5Session *self)
     res = hev_socks5_client_connect (HEV_SOCKS5_CLIENT (self), srv->addr,
                                      srv->port);
     if (res < 0) {
-        LOG_I ("%p socks5 session connect", self);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "proxy-connect",
+                                "connect-failed", 0);
         return;
     }
 
@@ -42,11 +43,14 @@ hev_socks5_session_run (HevSocks5Session *self)
 
     res = hev_socks5_client_handshake (HEV_SOCKS5_CLIENT (self), srv->pipeline);
     if (res < 0) {
-        LOG_I ("%p socks5 session handshake", self);
+        hev_socks5_log_failure (HEV_SOCKS5 (self), "socks-handshake",
+                                "handshake-failed", 0);
         return;
     }
 
     iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
+    if (HEV_SOCKS5 (self)->type != HEV_SOCKS5_TYPE_TCP)
+        hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), "udp-association");
     iface->splicer (self);
 }
 
