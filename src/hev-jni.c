@@ -55,7 +55,8 @@ static void native_start_service (JNIEnv *env, jobject thiz, jstring conig_path,
                                   jint fd);
 static void native_stop_service (JNIEnv *env, jobject thiz);
 static jlongArray native_get_stats (JNIEnv *env, jobject thiz);
-static void native_configure_log_history (JNIEnv *env, jobject thiz, jstring json);
+static void native_configure_log_history (JNIEnv *env, jobject thiz,
+                                          jstring json);
 static jstring native_get_log_history_state (JNIEnv *env, jobject thiz);
 
 static JNINativeMethod native_methods[] = {
@@ -70,7 +71,8 @@ static JNINativeMethod native_methods[] = {
 };
 
 static int
-json_string_value (const char *json, const char *key, char *value, size_t value_size)
+json_string_value (const char *json, const char *key, char *value,
+                   size_t value_size)
 {
     const char *cursor;
     size_t length = 0;
@@ -82,7 +84,8 @@ json_string_value (const char *json, const char *key, char *value, size_t value_
     if (!cursor)
         return -1;
     cursor++;
-    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' || *cursor == '\r')
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' ||
+           *cursor == '\r')
         cursor++;
     if (*cursor != '"')
         return -1;
@@ -160,10 +163,12 @@ configure_log_history_json (const char *json)
     if (!json || !*json || 0 == strcmp (json, "null"))
         return hev_socks5_tunnel_log_history_configure (NULL, NULL, NULL);
 
-    value = json_string_value (json, "\"directory\"", directory, sizeof (directory));
+    value = json_string_value (json, "\"directory\"", directory,
+                               sizeof (directory));
     if (value != 1 || directory[0] != '/')
         return -1;
-    value = json_string_value (json, "\"connectionId\"", connection_id, sizeof (connection_id));
+    value = json_string_value (json, "\"connectionId\"", connection_id,
+                               sizeof (connection_id));
     if (value < 0)
         return -1;
     if (value == 0)
@@ -172,10 +177,12 @@ configure_log_history_json (const char *json)
     policy.max_segment_bytes = 2u * 1024u * 1024u;
     policy.max_source_bytes = 8u * 1024u * 1024u;
     policy.max_segments = 4u;
-    value = json_size_value (json, "\"maxSegmentBytes\"", &policy.max_segment_bytes);
+    value = json_size_value (json, "\"maxSegmentBytes\"",
+                             &policy.max_segment_bytes);
     if (value < 0)
         return -1;
-    value = json_size_value (json, "\"maxSourceBytes\"", &policy.max_source_bytes);
+    value =
+        json_size_value (json, "\"maxSourceBytes\"", &policy.max_source_bytes);
     if (value < 0)
         return -1;
     {

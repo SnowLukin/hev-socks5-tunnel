@@ -652,7 +652,7 @@ hev_socks5_tunnel_run (void)
 void
 hev_socks5_tunnel_stop (void)
 {
-    int res;
+    int res = 0;
     int fd;
 
     LOG_D ("socks5 tunnel stop");

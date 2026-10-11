@@ -26,6 +26,49 @@
 
 #include "hev-utils.h"
 
+const char *
+hev_lwip_error_string (err_t error)
+{
+    switch (error) {
+    case ERR_OK:
+        return "ok";
+    case ERR_MEM:
+        return "out-of-memory";
+    case ERR_BUF:
+        return "buffer-error";
+    case ERR_TIMEOUT:
+        return "timeout";
+    case ERR_RTE:
+        return "no-route";
+    case ERR_INPROGRESS:
+        return "in-progress";
+    case ERR_VAL:
+        return "invalid-value";
+    case ERR_WOULDBLOCK:
+        return "would-block";
+    case ERR_USE:
+        return "address-in-use";
+    case ERR_ALREADY:
+        return "already-connecting";
+    case ERR_ISCONN:
+        return "already-connected";
+    case ERR_CONN:
+        return "not-connected";
+    case ERR_IF:
+        return "interface-error";
+    case ERR_ABRT:
+        return "connection-aborted";
+    case ERR_RST:
+        return "connection-reset";
+    case ERR_CLSD:
+        return "connection-closed";
+    case ERR_ARG:
+        return "invalid-argument";
+    default:
+        return "unknown-lwip-error";
+    }
+}
+
 void
 run_as_daemon (const char *pid_file)
 {
