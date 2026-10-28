@@ -7,6 +7,8 @@
  ============================================================================
  */
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -48,6 +50,16 @@ static int connect_timeout;
 static int tcp_read_write_timeout;
 static int udp_read_write_timeout;
 static int limit_nofile;
+static int udp_max_sessions;
+static int tcp_max_sessions;
+static int udp_evict_min_idle;
+static int tcp_evict_min_idle;
+static int udp_queue_frames;
+static int udp_queue_total_frames;
+static int udp_protect_age;
+static int udp_protect_idle;
+static int tcp_protect_age;
+static int tcp_protect_idle;
 static int log_level;
 
 static int
@@ -331,6 +343,22 @@ hev_config_parse_log_level (const char *value)
 }
 
 static int
+hev_config_parse_misc_count (const char *key, const char *value, int fallback)
+{
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol (value, &end, 10);
+    if (errno || end == value || *end || v < 0 || v > INT_MAX) {
+        LOG_E ("config misc %s: %s is not a non-negative number", key, value);
+        return fallback;
+    }
+
+    return v;
+}
+
+static int
 hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
 {
     yaml_node_pair_t *pair;
@@ -385,7 +413,33 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             log_level = hev_config_parse_log_level (value);
         else if (0 == strcmp (key, "limit-nofile"))
             limit_nofile = strtol (value, NULL, 10);
+        else if (0 == strcmp (key, "udp-max-sessions"))
+            udp_max_sessions = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "tcp-max-sessions"))
+            tcp_max_sessions = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "udp-evict-min-idle"))
+            udp_evict_min_idle = hev_config_parse_misc_count (key, value, 2000);
+        else if (0 == strcmp (key, "tcp-evict-min-idle"))
+            tcp_evict_min_idle =
+                hev_config_parse_misc_count (key, value, 60000);
+        else if (0 == strcmp (key, "udp-queue-frames"))
+            udp_queue_frames =
+                hev_config_parse_misc_count (key, value, UDP_POOL_SIZE + 1);
+        else if (0 == strcmp (key, "udp-queue-total-frames"))
+            udp_queue_total_frames =
+                hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "udp-evict-protect-age"))
+            udp_protect_age = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "udp-evict-protect-idle"))
+            udp_protect_idle = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "tcp-evict-protect-age"))
+            tcp_protect_age = hev_config_parse_misc_count (key, value, 0);
+        else if (0 == strcmp (key, "tcp-evict-protect-idle"))
+            tcp_protect_idle = hev_config_parse_misc_count (key, value, 0);
     }
+
+    if (udp_queue_frames <= 0 || udp_queue_frames > UDP_POOL_SIZE + 1)
+        udp_queue_frames = UDP_POOL_SIZE + 1;
 
     if (tcp_rw_timeout <= 0)
         tcp_rw_timeout = rw_timeout;
@@ -489,6 +543,16 @@ hev_config_reset (void)
     tcp_read_write_timeout = 300000;
     udp_read_write_timeout = 60000;
     limit_nofile = 65535;
+    udp_max_sessions = 0;
+    tcp_max_sessions = 0;
+    udp_evict_min_idle = 2000;
+    tcp_evict_min_idle = 60000;
+    udp_queue_frames = UDP_POOL_SIZE + 1;
+    udp_queue_total_frames = 0;
+    udp_protect_age = 0;
+    udp_protect_idle = 0;
+    tcp_protect_age = 0;
+    tcp_protect_idle = 0;
     log_level = HEV_LOGGER_WARN;
 }
 
@@ -716,6 +780,66 @@ int
 hev_config_get_misc_limit_nofile (void)
 {
     return limit_nofile;
+}
+
+int
+hev_config_get_misc_udp_max_sessions (void)
+{
+    return udp_max_sessions;
+}
+
+int
+hev_config_get_misc_tcp_max_sessions (void)
+{
+    return tcp_max_sessions;
+}
+
+int
+hev_config_get_misc_udp_evict_min_idle (void)
+{
+    return udp_evict_min_idle;
+}
+
+int
+hev_config_get_misc_tcp_evict_min_idle (void)
+{
+    return tcp_evict_min_idle;
+}
+
+int
+hev_config_get_misc_udp_queue_frames (void)
+{
+    return udp_queue_frames;
+}
+
+int
+hev_config_get_misc_udp_queue_total_frames (void)
+{
+    return udp_queue_total_frames;
+}
+
+int
+hev_config_get_misc_udp_evict_protect_age (void)
+{
+    return udp_protect_age;
+}
+
+int
+hev_config_get_misc_udp_evict_protect_idle (void)
+{
+    return udp_protect_idle;
+}
+
+int
+hev_config_get_misc_tcp_evict_protect_age (void)
+{
+    return tcp_protect_age;
+}
+
+int
+hev_config_get_misc_tcp_evict_protect_idle (void)
+{
+    return tcp_protect_idle;
 }
 
 const char *

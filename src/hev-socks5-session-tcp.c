@@ -109,6 +109,7 @@ tcp_splice_b (HevSocks5SessionTCP *self)
             }
         } else {
             hev_ring_buffer_write_finish (self->buffer, s);
+            self->data.answered = 1;
         }
     } else {
         res = 0;

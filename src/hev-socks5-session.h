@@ -10,6 +10,7 @@
 #ifndef __HEV_SOCKS5_SESSION_H__
 #define __HEV_SOCKS5_SESSION_H__
 
+#include <stdint.h>
 #include <hev-task.h>
 
 #include "hev-list.h"
@@ -27,6 +28,11 @@ struct _HevSocks5SessionData
     HevListNode node;
     HevTask *task;
     HevSocks5Session *self;
+    int64_t create_time;
+    int64_t active_time;
+    int type;
+    int dying;
+    int answered;
 };
 
 struct _HevSocks5SessionIface

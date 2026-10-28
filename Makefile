@@ -77,7 +77,7 @@ ifeq ($(V),1)
 	undefine ECHO_PREFIX
 endif
 
-.PHONY: exec static shared clean install uninstall tp-static tp-shared tp-clean test-log-history
+.PHONY: exec static shared clean install uninstall tp-static tp-shared tp-clean test-log-history test-session-guard
 
 exec : $(EXEC_TARGET)
 
@@ -98,6 +98,9 @@ test-log-history:
 		tests/log_history_test.c src/misc/hev-logger.c \
 		src/core/src/hev-socks5-logger.c src/core/src/hev-socks5-log-history.c \
 		-o $$tmp && $$tmp; result=$$?; rm -f $$tmp; exit $$result
+
+test-session-guard : static
+	@tests/session-guard/run.sh
 
 static : $(STATIC_TARGET)
 

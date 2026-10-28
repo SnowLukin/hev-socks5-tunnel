@@ -23,4 +23,6 @@ void hev_socks5_tunnel_stats (size_t *tx_packets, size_t *tx_bytes,
 
 void hev_socks5_tunnel_update_session (HevListNode *node);
 
+int hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count);
+
 #endif /* __HEV_SOCKS5_TUNNEL_H__ */
