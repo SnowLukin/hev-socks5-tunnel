@@ -562,22 +562,24 @@ func partReview() {
 		fmt.Sprintf("probe_kb=%d hold_ms=%d", s.lastProbeKB, s.probeHoldMs))
 	check("K6 probe off", probeOff() == 0, "")
 	r.quit("probe-reset")
+	_, ok := stats()
+	check("W4 stats are unavailable once the tunnel has stopped", !ok, "")
 }
 
 func strp(s string) *string { return &s }
 
 // D. Пул DNS (0009): UDP на 53 к адресам из списка идёт в свой пул мимо потолка UDP и колбэка памяти.
 func partDNS() {
-	ret, size, untouched := statsCallerWithSize(statsGuardSize())
-	check("D0 stats accept the size of a caller without dns fields and write nothing past it",
-		ret == 0 && size == statsGuardSize() && untouched, fmt.Sprintf("ret=%d size=%d/%d untouched=%v", ret, size, statsGuardSize(), untouched))
-	check("D0 stats refuse a size below that", statsWithSize(statsGuardSize()-1) == -1, "")
-
 	// Потолок UDP 4, а молчащий поток вытесняется только после 60 с тишины: новый обычный UDP получает отказ.
 	// Таймаут пула 4 с: шаги D1-D3 укладываются в 2 с, D4 ждёт его истечения.
 	conf := "  udp-max-sessions: 4\n  udp-evict-min-idle: 60000\n" +
 		"  dns-priority-sessions: 2\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9,8.8.8.8'\n"
 	r := newRig(cfg(conf))
+	ret, size, untouched := statsCallerWithSize(statsGuardSize())
+	check("D0 stats accept the size of a caller without dns fields and write nothing past it",
+		ret == 0 && size == statsGuardSize() && untouched, fmt.Sprintf("ret=%d size=%d/%d untouched=%v", ret, size, statsGuardSize(), untouched))
+	check("D0 stats refuse a size below that", statsWithSize(statsGuardSize()-1) == -1, "")
+
 	s := mustStats()
 	check("D1 pool comes from config", s.dnsCap == 2 && s.dnsLive == 0, fmt.Sprintf("dns_cap=%d dns_live=%d", s.dnsCap, s.dnsLive))
 	fill := r.openUDP(4, 24000)
@@ -676,14 +678,14 @@ func partDNS() {
 // D6. Запрос, не влезший в полный пул молодых без ответа (0011), идёт обычным путём UDP: при открытом
 // приёме стартует обычной сессией, в HOLD и CLOSED колбэка получает отказ, как любой новый UDP.
 func partDNSOverflow() {
-	ret, size, untouched := statsCallerWithSize(statsPoolSize())
-	check("D6 stats accept the size of a caller without dns_overflow and write nothing past it",
-		ret == 0 && size == statsPoolSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
-
 	// Потолок UDP 8 с запасом, пул 2 на 9.9.9.9: четыре запроса разом - два в пул, два мимо него.
 	conf := "  udp-max-sessions: 8\n  udp-evict-min-idle: 60000\n" +
 		"  dns-priority-sessions: 2\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9'\n"
 	r := newRig(cfg(conf))
+	ret, size, untouched := statsCallerWithSize(statsPoolSize())
+	check("D6 stats accept the size of a caller without dns_overflow and write nothing past it",
+		ret == 0 && size == statsPoolSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
+
 	burst := func(tag string) (int, sessionStats, sessionStats) {
 		// Ответившие сессии пула вытесняются только после секунды тишины (F1).
 		time.Sleep(1200 * time.Millisecond)
