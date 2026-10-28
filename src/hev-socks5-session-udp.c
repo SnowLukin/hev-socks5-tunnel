@@ -215,9 +215,10 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, unsigned int num)
                                     hev_lwip_error_string (err), err);
             return -1;
         }
+
+        self->data.answered = 1;
     }
 
-    self->data.answered = 1;
     return 1;
 }
 
