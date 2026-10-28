@@ -420,11 +420,14 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
         else if (0 == strcmp (key, "udp-evict-min-idle"))
             udp_evict_min_idle = hev_config_parse_misc_count (key, value, 2000);
         else if (0 == strcmp (key, "tcp-evict-min-idle"))
-            tcp_evict_min_idle = hev_config_parse_misc_count (key, value, 60000);
+            tcp_evict_min_idle =
+                hev_config_parse_misc_count (key, value, 60000);
         else if (0 == strcmp (key, "udp-queue-frames"))
-            udp_queue_frames = hev_config_parse_misc_count (key, value, UDP_POOL_SIZE + 1);
+            udp_queue_frames =
+                hev_config_parse_misc_count (key, value, UDP_POOL_SIZE + 1);
         else if (0 == strcmp (key, "udp-queue-total-frames"))
-            udp_queue_total_frames = hev_config_parse_misc_count (key, value, 0);
+            udp_queue_total_frames =
+                hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "udp-evict-protect-age"))
             udp_protect_age = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "udp-evict-protect-idle"))

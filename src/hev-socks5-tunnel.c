@@ -1404,12 +1404,13 @@ hev_socks5_tunnel_set_session_cap (int type, int max_live,
         return -1;
 
     if (max_live < 0)
-        max_live = (i == SESSION_UDP) ? hev_config_get_misc_udp_max_sessions ()
-                                      : hev_config_get_misc_tcp_max_sessions ();
+        max_live = (i == SESSION_UDP) ?
+                       hev_config_get_misc_udp_max_sessions () :
+                       hev_config_get_misc_tcp_max_sessions ();
     if (evict_min_idle_ms < 0)
-        evict_min_idle_ms = (i == SESSION_UDP)
-                                ? hev_config_get_misc_udp_evict_min_idle ()
-                                : hev_config_get_misc_tcp_evict_min_idle ();
+        evict_min_idle_ms = (i == SESSION_UDP) ?
+                                hev_config_get_misc_udp_evict_min_idle () :
+                                hev_config_get_misc_tcp_evict_min_idle ();
 
     __atomic_store_n (&session_cap[i], max_live, __ATOMIC_RELAXED);
     __atomic_store_n (&session_evict_idle_ms[i], evict_min_idle_ms,
@@ -1435,16 +1436,14 @@ hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames, int total_frames)
 }
 
 int
-hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms,
-                                     int min_idle_ms)
+hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms, int min_idle_ms)
 {
     int i = session_index (type);
 
     if (i < 0 || min_age_ms < 0 || min_idle_ms < 0)
         return -1;
 
-    __atomic_store_n (&session_protect_age_ms[i], min_age_ms,
-                      __ATOMIC_RELAXED);
+    __atomic_store_n (&session_protect_age_ms[i], min_age_ms, __ATOMIC_RELAXED);
     __atomic_store_n (&session_protect_idle_ms[i], min_idle_ms,
                       __ATOMIC_RELAXED);
 
@@ -1473,7 +1472,8 @@ hev_socks5_tunnel_set_admission (int types, int state)
     if (state < HEV_SOCKS5_TUNNEL_ADMIT_OPEN ||
         state > HEV_SOCKS5_TUNNEL_ADMIT_CLOSED)
         return -1;
-    if (types & ~(HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP))
+    if (types &
+        ~(HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP))
         return -1;
 
     for (i = 0; i < SESSION_TYPES; i++)
@@ -1490,8 +1490,8 @@ hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
                                     int hysteresis_kb, int young_ms,
                                     int young_reserve_kb)
 {
-    HevSocks5TunnelProbe c = { probe,         user_data,      interval_ms,
-                               hold_below_kb, close_below_kb, hysteresis_kb,
+    HevSocks5TunnelProbe c = { probe,         user_data,       interval_ms,
+                               hold_below_kb, close_below_kb,  hysteresis_kb,
                                young_ms,      young_reserve_kb };
 
     if (probe && (close_below_kb < 0 || hold_below_kb < close_below_kb ||
@@ -1523,39 +1523,39 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
 
     memset (&s, 0, sizeof (s));
     s.size = sizeof (s);
-    s.udp_live = __atomic_load_n (&session_live_count[SESSION_UDP],
-                                  __ATOMIC_RELAXED);
-    s.tcp_live = __atomic_load_n (&session_live_count[SESSION_TCP],
-                                  __ATOMIC_RELAXED);
+    s.udp_live =
+        __atomic_load_n (&session_live_count[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_live =
+        __atomic_load_n (&session_live_count[SESSION_TCP], __ATOMIC_RELAXED);
     s.dying = __atomic_load_n (&session_dying_count, __ATOMIC_RELAXED);
-    s.udp_created = __atomic_load_n (&stat_created[SESSION_UDP],
-                                     __ATOMIC_RELAXED);
-    s.tcp_created = __atomic_load_n (&stat_created[SESSION_TCP],
-                                     __ATOMIC_RELAXED);
-    s.udp_evicted = __atomic_load_n (&stat_evicted[SESSION_UDP],
-                                     __ATOMIC_RELAXED);
-    s.tcp_evicted = __atomic_load_n (&stat_evicted[SESSION_TCP],
-                                     __ATOMIC_RELAXED);
-    s.udp_refused = __atomic_load_n (&stat_refused[SESSION_UDP],
-                                     __ATOMIC_RELAXED);
-    s.tcp_refused = __atomic_load_n (&stat_refused[SESSION_TCP],
-                                     __ATOMIC_RELAXED);
-    s.udp_relieved = __atomic_load_n (&stat_relieved[SESSION_UDP],
-                                      __ATOMIC_RELAXED);
-    s.tcp_relieved = __atomic_load_n (&stat_relieved[SESSION_TCP],
-                                      __ATOMIC_RELAXED);
+    s.udp_created =
+        __atomic_load_n (&stat_created[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_created =
+        __atomic_load_n (&stat_created[SESSION_TCP], __ATOMIC_RELAXED);
+    s.udp_evicted =
+        __atomic_load_n (&stat_evicted[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_evicted =
+        __atomic_load_n (&stat_evicted[SESSION_TCP], __ATOMIC_RELAXED);
+    s.udp_refused =
+        __atomic_load_n (&stat_refused[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_refused =
+        __atomic_load_n (&stat_refused[SESSION_TCP], __ATOMIC_RELAXED);
+    s.udp_relieved =
+        __atomic_load_n (&stat_relieved[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_relieved =
+        __atomic_load_n (&stat_relieved[SESSION_TCP], __ATOMIC_RELAXED);
     s.udp_cap = __atomic_load_n (&session_cap[SESSION_UDP], __ATOMIC_RELAXED);
     s.tcp_cap = __atomic_load_n (&session_cap[SESSION_TCP], __ATOMIC_RELAXED);
     s.last_probe_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
     s.udp_queued_frames = hev_socks5_session_udp_get_queued_frames ();
     s.udp_queue_dropped = hev_socks5_session_udp_get_queue_dropped ();
-    s.udp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_UDP],
-                                         __ATOMIC_RELAXED);
-    s.tcp_refused_adm = __atomic_load_n (&stat_refused_adm[SESSION_TCP],
-                                         __ATOMIC_RELAXED);
+    s.udp_refused_adm =
+        __atomic_load_n (&stat_refused_adm[SESSION_UDP], __ATOMIC_RELAXED);
+    s.tcp_refused_adm =
+        __atomic_load_n (&stat_refused_adm[SESSION_TCP], __ATOMIC_RELAXED);
     for (i = 0; i < SESSION_TYPES; i++)
-        admission[i] = admission_for (
-            i, __atomic_load_n (&probe_state, __ATOMIC_RELAXED));
+        admission[i] =
+            admission_for (i, __atomic_load_n (&probe_state, __ATOMIC_RELAXED));
     s.admission_udp = admission[SESSION_UDP];
     s.admission_tcp = admission[SESSION_TCP];
 

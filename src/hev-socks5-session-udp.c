@@ -51,11 +51,9 @@ queued_total_add (int n)
 }
 
 void
-hev_socks5_session_udp_set_queue_cap (int per_session_frames,
-                                      int total_frames)
+hev_socks5_session_udp_set_queue_cap (int per_session_frames, int total_frames)
 {
-    __atomic_store_n (&queue_frames_cap, per_session_frames,
-                      __ATOMIC_RELAXED);
+    __atomic_store_n (&queue_frames_cap, per_session_frames, __ATOMIC_RELAXED);
     __atomic_store_n (&queue_total_cap, total_frames, __ATOMIC_RELAXED);
 }
 
