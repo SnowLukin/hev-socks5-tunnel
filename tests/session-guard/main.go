@@ -543,6 +543,8 @@ func partReview() {
 		fmt.Sprintf("probe_kb=%d hold_ms=%d", s.lastProbeKB, s.probeHoldMs))
 	check("K6 probe off", probeOff() == 0, "")
 	r.quit("probe-reset")
+	_, ok := stats()
+	check("W4 stats are unavailable once the tunnel has stopped", !ok, "")
 }
 
 func main() {

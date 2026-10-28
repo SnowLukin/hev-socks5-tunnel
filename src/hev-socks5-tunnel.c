@@ -136,6 +136,8 @@ static int64_t probe_last_kb = -1;
 /* Time spent in each probe state since the tunnel start, for stats. */
 static int64_t probe_state_ms[HEV_SOCKS5_TUNNEL_ADMIT_CLOSED + 1];
 static int64_t probe_state_since;
+/* Counters belong to the current start only after it has reset them. */
+static int stats_ready;
 
 #define YOUNG_RING 128
 static int64_t young_ring[YOUNG_RING];
@@ -1255,6 +1257,8 @@ session_limits_init (void)
         __atomic_store_n (&stat_refused[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_relieved[i], 0, __ATOMIC_RELAXED);
     }
+
+    __atomic_store_n (&stats_ready, 1, __ATOMIC_RELEASE);
 }
 
 int
@@ -1311,6 +1315,8 @@ void
 hev_socks5_tunnel_fini (void)
 {
     LOG_D ("socks5 tunnel fini");
+
+    __atomic_store_n (&stats_ready, 0, __ATOMIC_RELAXED);
 
 retry:
     if (atomic_fetch_and (&tsync, ~(SYNC_SEND | SYNC_SENT)) & SYNC_WAIT) {
@@ -1539,7 +1545,8 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     int admission[SESSION_TYPES];
     int i;
 
-    if (!stats || stats->size < sizeof (s))
+    if (!stats || stats->size < sizeof (s) ||
+        !__atomic_load_n (&stats_ready, __ATOMIC_ACQUIRE))
         return -1;
 
     memset (&s, 0, sizeof (s));

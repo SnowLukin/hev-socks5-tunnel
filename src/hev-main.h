@@ -295,7 +295,9 @@ typedef struct
  *
  * Counters restart with every tunnel start. Safe to call from any thread.
  *
- * Returns: zero, or -1 if @stats->size is too small.
+ * Returns: zero, or -1 if @stats->size is too small or the tunnel is not
+ * running, so a caller never takes the previous start's counters for the
+ * current one.
  */
 int hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats);
 
