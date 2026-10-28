@@ -14,7 +14,9 @@
 #include <time.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <sys/ioctl.h>
+#include <arpa/inet.h>
 
 #include <lwip/tcp.h>
 #include <lwip/udp.h>
@@ -55,8 +57,15 @@ enum
 {
     SESSION_UDP,
     SESSION_TCP,
+    /* UDP to the DNS resolvers, in a pool of its own. */
+    SESSION_DNS,
     SESSION_TYPES,
 };
+
+#define DNS_PORT 53
+#define DNS_PRIORITY_ADDRS 4
+/* A resolver retries a query after about this long without a reply. */
+#define DNS_PRIORITY_GRACE_MS 1000
 
 static int run;
 static atomic_int tsync;
@@ -109,6 +118,17 @@ static uint64_t stat_refused_adm[SESSION_TYPES];
 
 /* HEV_SOCKS5_TUNNEL_ADMIT_* set from outside. */
 static int admission_ext[SESSION_TYPES];
+
+/*
+ * Written from any thread, read by the tunnel thread. A flow that starts
+ * while the address list changes may be matched against either list.
+ */
+static int dns_priority_cap;
+static int dns_priority_timeout_ms;
+static int dns_priority_addr_count;
+static uint32_t dns_priority_addr[DNS_PRIORITY_ADDRS];
+/* Queries that found the pool full and started as ordinary UDP sessions. */
+static uint64_t stat_dns_overflow;
 
 typedef struct _HevSocks5TunnelProbe HevSocks5TunnelProbe;
 
@@ -225,15 +245,6 @@ stat_inc (uint64_t *counter)
 }
 
 static int
-session_type_of (HevSocks5SessionData *sd)
-{
-    if (HEV_OBJECT (sd->self)->klass == HEV_SOCKS5_SESSION_UDP_TYPE)
-        return SESSION_UDP;
-
-    return SESSION_TCP;
-}
-
-static int
 sessions_empty (void)
 {
     int i;
@@ -260,7 +271,8 @@ session_kill (HevSocks5SessionData *sd)
     hev_list_del (&session_live[sd->type], &sd->node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] - 1, __ATOMIC_RELAXED);
-    session_count--;
+    if (sd->type != SESSION_DNS)
+        session_count--;
 
     sd->dying = 1;
     hev_list_add_tail (&session_dying, &sd->node);
@@ -466,6 +478,120 @@ refuse:
     return -1;
 }
 
+/*
+ * Name lookups get a small pool outside the memory probe and the UDP cap: in
+ * a storm of new flows a lookup would otherwise lose to the storm, and every
+ * new connection of the user fails before it starts. A full pool gives up an
+ * answered session first, then one that waited longer than a resolver waits
+ * for a reply. While all are young and unanswered the new query does not get
+ * in: evicting them would let a flood of queries kill each one before its
+ * reply. It then takes the ordinary UDP path, so a burst of lookups larger
+ * than the pool, as when the tunnel starts, is limited by the UDP cap and the
+ * memory probe and not dropped while there is room.
+ */
+static int
+session_admit_dns (void)
+{
+    int64_t now = monotonic_ms ();
+    HevListNode *node;
+    int cap;
+
+    admit_replaced = 0;
+    cap = __atomic_load_n (&dns_priority_cap, __ATOMIC_RELAXED);
+    if (session_live_count[SESSION_DNS] < cap)
+        return 0;
+
+    node = hev_list_first (&session_live[SESSION_DNS]);
+    for (; node; node = hev_list_node_next (node)) {
+        HevSocks5SessionData *sd;
+
+        sd = container_of (node, HevSocks5SessionData, node);
+        /* A long-lived resolver socket keeps its session while it talks. */
+        if (sd->answered ? now - sd->active_time < DNS_PRIORITY_GRACE_MS :
+                           now - sd->create_time < DNS_PRIORITY_GRACE_MS)
+            continue;
+
+        session_kill (sd);
+        stat_inc (&stat_evicted[SESSION_DNS]);
+        admit_replaced = 1;
+        return 0;
+    }
+
+    stat_inc (&stat_refused[SESSION_DNS]);
+    return -1;
+}
+
+static int
+dns_priority_match (const ip_addr_t *addr, u16_t port)
+{
+    uint32_t a;
+    int i, n;
+
+    if (port != DNS_PORT ||
+        __atomic_load_n (&dns_priority_cap, __ATOMIC_ACQUIRE) <= 0)
+        return 0;
+
+    n = __atomic_load_n (&dns_priority_addr_count, __ATOMIC_RELAXED);
+    if (!n)
+        return 1;
+    if (addr->type != IPADDR_TYPE_V4)
+        return 0;
+
+    a = ip_2_ip4 (addr)->addr;
+    for (i = 0; i < n; i++)
+        if (__atomic_load_n (&dns_priority_addr[i], __ATOMIC_RELAXED) == a)
+            return 1;
+
+    return 0;
+}
+
+/* Comma or space separated IPv4 addresses, at most DNS_PRIORITY_ADDRS. */
+static int
+dns_priority_parse (const char *list, uint32_t *addrs)
+{
+    char buf[256], *tok, *save;
+    int n = 0;
+
+    if (!list || !list[0])
+        return -1;
+    if (0 == strcmp (list, "any"))
+        return 0;
+
+    strncpy (buf, list, sizeof (buf) - 1);
+    buf[sizeof (buf) - 1] = '\0';
+    for (tok = strtok_r (buf, ", ", &save); tok;
+         tok = strtok_r (NULL, ", ", &save)) {
+        struct in_addr in;
+
+        if (n == DNS_PRIORITY_ADDRS || inet_pton (AF_INET, tok, &in) != 1)
+            return -1;
+        addrs[n++] = in.s_addr;
+    }
+
+    return n ? n : -1;
+}
+
+/* The pool bypasses the memory probe, so its size stays small. */
+static int
+dns_priority_valid (int cap, int timeout_ms)
+{
+    return cap >= 0 && cap <= 32 && timeout_ms >= 1000 && timeout_ms <= 10000;
+}
+
+static void
+dns_priority_store (int cap, int timeout_ms, const uint32_t *addrs, int n)
+{
+    int i;
+
+    /* Off while the list changes: a half-written list must not match. */
+    __atomic_store_n (&dns_priority_cap, 0, __ATOMIC_SEQ_CST);
+    for (i = 0; i < n; i++)
+        __atomic_store_n (&dns_priority_addr[i], addrs[i], __ATOMIC_RELAXED);
+    __atomic_store_n (&dns_priority_addr_count, n, __ATOMIC_RELAXED);
+    __atomic_store_n (&dns_priority_timeout_ms, timeout_ms, __ATOMIC_RELAXED);
+    __atomic_store_n (&dns_priority_cap, cap, __ATOMIC_RELEASE);
+}
+
 /* Upstream max-session-count: rotate out the least recently active. */
 static void
 session_rotate (void)
@@ -489,20 +615,26 @@ session_rotate (void)
 }
 
 static void
-hev_socks5_tunnel_insert_session (HevListNode *node)
+hev_socks5_tunnel_insert_session (HevListNode *node, int type)
 {
     HevSocks5SessionData *sd;
 
     sd = container_of (node, HevSocks5SessionData, node);
     sd->create_time = monotonic_ms ();
     sd->active_time = sd->create_time;
-    sd->type = session_type_of (sd);
+    sd->type = type;
     sd->dying = 0;
+    sd->timeout = 0;
+    if (type == SESSION_DNS)
+        sd->timeout =
+            __atomic_load_n (&dns_priority_timeout_ms, __ATOMIC_RELAXED);
 
     hev_list_add_tail (&session_live[sd->type], node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] + 1, __ATOMIC_RELAXED);
-    session_count++;
+    /* max-session-count rotates only UDP and TCP, so the pool is not counted. */
+    if (sd->type != SESSION_DNS)
+        session_count++;
     stat_inc (&stat_created[sd->type]);
     /*
      * A replacement frees the evicted session's memory as it takes its own,
@@ -531,7 +663,8 @@ hev_socks5_tunnel_delete_session (HevListNode *node)
     hev_list_del (&session_live[sd->type], node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] - 1, __ATOMIC_RELAXED);
-    session_count--;
+    if (sd->type != SESSION_DNS)
+        session_count--;
 }
 
 void
@@ -597,7 +730,7 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node);
+    hev_socks5_tunnel_insert_session (node, SESSION_TCP);
     hev_task_run (task, hev_socks5_session_task_entry, tcp);
     hev_task_wakeup (task_lwip_timer);
 
@@ -664,6 +797,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevMappedDNS *dns;
     int stack_size;
     HevTask *task;
+    int type, overflow;
 
     if (!READ_ONCE (run)) {
         udp_refuse (pcb);
@@ -688,7 +822,15 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
 
     /* Admission may evict a session, so it goes after the allocation. */
-    if (session_admit (SESSION_UDP) < 0) {
+    type = SESSION_UDP;
+    overflow = 0;
+    if (dns_priority_match (addr, port)) {
+        if (session_admit_dns () == 0)
+            type = SESSION_DNS;
+        else
+            overflow = 1;
+    }
+    if (type == SESSION_UDP && session_admit (SESSION_UDP) < 0) {
         hev_task_unref (task);
         udp_refuse (pcb);
         return;
@@ -703,7 +845,9 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node);
+    hev_socks5_tunnel_insert_session (node, type);
+    if (overflow)
+        stat_inc (&stat_dns_overflow);
     hev_task_run (task, hev_socks5_session_task_entry, udp);
     hev_task_wakeup (task_lwip_timer);
 }
@@ -1207,7 +1351,8 @@ mapped_dns_fini (void)
 static void
 session_limits_init (void)
 {
-    int i;
+    uint32_t addrs[DNS_PRIORITY_ADDRS];
+    int i, n, cap;
 
     __atomic_store_n (&session_cap[SESSION_UDP],
                       hev_config_get_misc_udp_max_sessions (),
@@ -1247,6 +1392,24 @@ session_limits_init (void)
     __atomic_store_n (&probe_last_kb, -1, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
     memset (young_ring, 0, sizeof (young_ring));
+    __atomic_store_n (&stat_dns_overflow, 0, __ATOMIC_RELAXED);
+
+    cap = hev_config_get_misc_dns_priority_sessions ();
+    n = dns_priority_parse (hev_config_get_misc_dns_priority_addresses (),
+                            addrs);
+    if (cap && n < 0) {
+        LOG_E ("socks5 tunnel dns-priority-addresses invalid, pool off");
+        cap = 0;
+        n = 0;
+    }
+    if (!dns_priority_valid (cap,
+                             hev_config_get_misc_dns_priority_timeout ())) {
+        LOG_E ("socks5 tunnel dns-priority size or timeout out of range, "
+               "pool off");
+        cap = 0;
+    }
+    dns_priority_store (cap, hev_config_get_misc_dns_priority_timeout (), addrs,
+                        n);
 
     for (i = 0; i < SESSION_TYPES; i++) {
         __atomic_store_n (&admission_ext[i], HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
@@ -1397,6 +1560,9 @@ hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
     HevSocks5TunnelRelief relief = { types, idle_ms, max_count };
     ssize_t res = -1;
 
+    if (types & ~(HEV_SOCKS5_TUNNEL_RELIEF_UDP | HEV_SOCKS5_TUNNEL_RELIEF_TCP))
+        return -1;
+
     pthread_mutex_lock (&relief_mutex);
     if (relief_fds[1] >= 0)
         res = write (relief_fds[1], &relief, sizeof (relief));
@@ -1478,6 +1644,30 @@ hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms, int min_idle_ms)
 }
 
 int
+hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
+                                    const char *addresses)
+{
+    uint32_t addrs[DNS_PRIORITY_ADDRS];
+    int n;
+
+    if (max_sessions < 0)
+        max_sessions = hev_config_get_misc_dns_priority_sessions ();
+    if (timeout_ms <= 0)
+        timeout_ms = hev_config_get_misc_dns_priority_timeout ();
+    if (!addresses)
+        addresses = hev_config_get_misc_dns_priority_addresses ();
+
+    n = dns_priority_parse (addresses, addrs);
+    if ((max_sessions && n < 0) ||
+        !dns_priority_valid (max_sessions, timeout_ms))
+        return -1;
+
+    dns_priority_store (max_sessions, timeout_ms, addrs, n < 0 ? 0 : n);
+
+    return 0;
+}
+
+int
 hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types)
 {
     int all = HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP;
@@ -1545,7 +1735,8 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     int admission[SESSION_TYPES];
     int i;
 
-    if (!stats || stats->size < sizeof (s) ||
+    if (!stats ||
+        stats->size < offsetof (HevSocks5TunnelSessionStats, dns_live) ||
         !__atomic_load_n (&stats_ready, __ATOMIC_ACQUIRE))
         return -1;
 
@@ -1598,8 +1789,20 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
         else
             s.probe_closed_ms = ms;
     }
+    s.dns_live =
+        __atomic_load_n (&session_live_count[SESSION_DNS], __ATOMIC_RELAXED);
+    s.dns_cap = __atomic_load_n (&dns_priority_cap, __ATOMIC_RELAXED);
+    s.dns_created =
+        __atomic_load_n (&stat_created[SESSION_DNS], __ATOMIC_RELAXED);
+    s.dns_evicted =
+        __atomic_load_n (&stat_evicted[SESSION_DNS], __ATOMIC_RELAXED);
+    s.dns_refused =
+        __atomic_load_n (&stat_refused[SESSION_DNS], __ATOMIC_RELAXED);
+    s.dns_overflow = __atomic_load_n (&stat_dns_overflow, __ATOMIC_RELAXED);
 
-    *stats = s;
+    /* A caller built against an older, shorter struct gets the fields it knows. */
+    s.size = stats->size < sizeof (s) ? stats->size : sizeof (s);
+    memcpy (stats, &s, s.size);
 
     return 0;
 }
