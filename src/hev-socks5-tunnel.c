@@ -437,7 +437,9 @@ session_admit (int type)
         return 0;
     }
 
-    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD)
+    /* At the cap the refusal is the cap's, even in HOLD. */
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD &&
+        (cap <= 0 || session_live_count[type] < cap))
         stat_inc (&stat_refused_adm[type]);
 refuse:
     stat_inc (&stat_refused[type]);
@@ -552,18 +554,24 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
     if (!READ_ONCE (run))
         return ERR_RST;
 
-    /* lwIP aborts the connection and the app gets a reset. */
-    if (session_admit (SESSION_TCP) < 0)
-        return ERR_RST;
-
-    tcp = hev_socks5_session_tcp_new (pcb, &mutex);
-    if (!tcp)
-        return ERR_MEM;
-
+    /*
+     * The task goes first: unref of a session that has no task takes the
+     * mutex the lwIP task already holds, and admission may evict a session.
+     */
     stack_size = hev_config_get_misc_task_stack_size ();
     task = hev_task_new (stack_size);
-    if (!task) {
-        hev_object_unref (HEV_OBJECT (tcp));
+    if (!task)
+        return ERR_MEM;
+
+    /* lwIP aborts the connection and the app gets a reset. */
+    if (session_admit (SESSION_TCP) < 0) {
+        hev_task_unref (task);
+        return ERR_RST;
+    }
+
+    tcp = hev_socks5_session_tcp_new (pcb, &mutex);
+    if (!tcp) {
+        hev_task_unref (task);
         return ERR_MEM;
     }
 
@@ -652,14 +660,16 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         }
     }
 
-    if (session_admit (SESSION_UDP) < 0) {
+    stack_size = hev_config_get_misc_task_stack_size ();
+    task = hev_task_new (stack_size);
+    if (!task) {
         udp_refuse (pcb);
         return;
     }
 
-    stack_size = hev_config_get_misc_task_stack_size ();
-    task = hev_task_new (stack_size);
-    if (!task) {
+    /* Admission may evict a session, so it goes after the allocation. */
+    if (session_admit (SESSION_UDP) < 0) {
+        hev_task_unref (task);
         udp_refuse (pcb);
         return;
     }
@@ -819,10 +829,13 @@ lwip_timer_task_entry (void *data)
         }
         hev_task_mutex_unlock (&mutex);
 
-        if (!sessions_empty ())
+        if (!sessions_empty ()) {
+            /* Keeps admission and stats current while no session is new. */
+            probe_update (monotonic_ms ());
             hev_task_sleep (TCP_TMR_INTERVAL);
-        else
+        } else {
             hev_task_yield (HEV_TASK_WAITIO);
+        }
     }
 }
 
@@ -1208,6 +1221,7 @@ session_limits_init (void)
 
     __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
                       __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_last_kb, -1, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
     memset (young_ring, 0, sizeof (young_ring));
 
@@ -1480,12 +1494,18 @@ hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
                                hold_below_kb, close_below_kb, hysteresis_kb,
                                young_ms,      young_reserve_kb };
 
+    if (probe && (close_below_kb < 0 || hold_below_kb < close_below_kb ||
+                  hysteresis_kb < 0 || young_ms < 0 || young_reserve_kb < 0))
+        return -1;
+
     if (c.interval_ms <= 0)
         c.interval_ms = 50;
 
     pthread_mutex_lock (&probe_mutex);
     probe_conf = c;
     pthread_mutex_unlock (&probe_mutex);
+    if (!probe)
+        __atomic_store_n (&probe_last_kb, -1, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
 
     return 0;

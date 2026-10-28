@@ -211,7 +211,9 @@ typedef long long (*HevSocks5TunnelMemoryProbe) (void *user_data);
 /**
  * hev_socks5_tunnel_set_memory_probe:
  * @probe: callback, NULL to turn the probe off
- * @user_data: passed to @probe
+ * @user_data: passed to @probe; must stay valid until the tunnel stops: the
+ *            tunnel thread may call the previous @probe with its @user_data
+ *            once more after it is replaced
  * @interval_ms: call @probe at most this often, the last result is used in
  *            between (50 if not positive)
  * @hold_below_kb: less than this available: HEV_SOCKS5_TUNNEL_ADMIT_HOLD
@@ -221,10 +223,12 @@ typedef long long (*HevSocks5TunnelMemoryProbe) (void *user_data);
  * @young_reserve_kb: subtracted from the available memory per young session
  *
  * The probe is checked when a new session is about to be created, so the
- * state follows memory from the first packet on without a timer. The setting
- * outlives tunnel restarts. Safe to call from any thread.
+ * state follows memory from the first packet on, and while sessions are live
+ * also on the lwIP timer. The setting outlives tunnel restarts. Safe to call
+ * from any thread.
  *
- * Returns: zero.
+ * Returns: zero, or -1 if thresholds are negative or @close_below_kb is
+ * above @hold_below_kb.
  */
 int hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
                                         void *user_data, int interval_ms,
