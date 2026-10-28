@@ -2,6 +2,7 @@ package main
 
 /*
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <sys/socket.h>
 #include "hev-main.h"
@@ -20,6 +21,29 @@ static int mk_socketpair(int *fds) {
 }
 
 static long long fake_avail = -1;
+// Size a caller built before the dns_* fields passes.
+static unsigned int stats_guard_size(void) { return offsetof(HevSocks5TunnelSessionStats, dns_live); }
+// Size a caller built before dns_overflow passes.
+static unsigned int stats_pool_size(void) { return offsetof(HevSocks5TunnelSessionStats, dns_overflow); }
+// Calls with that size over a struct filled with 0xab: hev must accept it, report the size back
+// and leave every byte after it alone.
+static int stats_old_caller(unsigned int size, unsigned int *out_size, int *untouched) {
+    HevSocks5TunnelSessionStats s;
+    size_t off = size;
+    memset(&s, 0xab, sizeof(s));
+    s.size = off;
+    int r = hev_socks5_tunnel_get_session_stats(&s);
+    const unsigned char *p = (const unsigned char *)&s;
+    *out_size = s.size;
+    *untouched = 1;
+    for (size_t i = off; i < sizeof(s); i++)
+        if (p[i] != 0xab)
+            *untouched = 0;
+    return r;
+}
+static int set_dns_priority(int max_sessions, int timeout_ms, const char *addresses) {
+    return hev_socks5_tunnel_set_dns_priority(max_sessions, timeout_ms, addresses);
+}
 static long long probe_calls;
 static long long fake_probe(void *user_data) {
     __atomic_fetch_add(&probe_calls, 1, __ATOMIC_RELAXED);
@@ -63,6 +87,9 @@ type sessionStats struct {
 	udpRefusedAdm, tcpRefusedAdm       uint64
 	udpQueueDropped                    uint64
 	probeHoldMs, probeClosedMs         uint64
+	dnsLive, dnsCap                    int
+	dnsCreated, dnsEvicted, dnsRefused uint64
+	dnsOverflow                        uint64
 }
 
 func startHev(cfg string, fd int) int {
@@ -124,6 +151,9 @@ func stats() (sessionStats, bool) {
 		udpRefusedAdm: uint64(s.udp_refused_adm), tcpRefusedAdm: uint64(s.tcp_refused_adm),
 		udpQueueDropped: uint64(s.udp_queue_dropped),
 		probeHoldMs:     uint64(s.probe_hold_ms), probeClosedMs: uint64(s.probe_closed_ms),
+		dnsLive: int(s.dns_live), dnsCap: int(s.dns_cap),
+		dnsCreated: uint64(s.dns_created), dnsEvicted: uint64(s.dns_evicted), dnsRefused: uint64(s.dns_refused),
+		dnsOverflow: uint64(s.dns_overflow),
 	}, true
 }
 
@@ -131,4 +161,24 @@ func socketpair() (int, int) {
 	var fds [2]C.int
 	C.mk_socketpair(&fds[0])
 	return int(fds[0]), int(fds[1])
+}
+
+func statsGuardSize() int { return int(C.stats_guard_size()) }
+func statsPoolSize() int  { return int(C.stats_pool_size()) }
+
+func statsCallerWithSize(size int) (ret int, got int, untouched bool) {
+	var sz C.uint
+	var un C.int
+	ret = int(C.stats_old_caller(C.uint(size), &sz, &un))
+	return ret, int(sz), un != 0
+}
+
+// setDnsPriority: addresses nil -> NULL (restore the config value).
+func setDnsPriority(maxSessions, timeoutMs int, addresses *string) int {
+	if addresses == nil {
+		return int(C.set_dns_priority(C.int(maxSessions), C.int(timeoutMs), nil))
+	}
+	cs := C.CString(*addresses)
+	defer C.free(unsafe.Pointer(cs))
+	return int(C.set_dns_priority(C.int(maxSessions), C.int(timeoutMs), cs))
 }
