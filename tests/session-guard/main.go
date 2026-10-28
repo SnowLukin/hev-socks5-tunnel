@@ -529,11 +529,18 @@ func partReview() {
 	s = mustStats()
 	check("H5 stats follow memory without new sessions", s.admUDP == admitOpen && s.lastProbeKB == 20*1024,
 		fmt.Sprintf("adm=%d probe_kb=%d", s.admUDP, s.lastProbeKB))
+	check("H5 time in hold is counted and stops after hold", s.probeHoldMs >= 100 && s.probeClosedMs == 0,
+		fmt.Sprintf("hold_ms=%d closed_ms=%d", s.probeHoldMs, s.probeClosedMs))
+	time.Sleep(300 * time.Millisecond)
+	later := mustStats()
+	check("H5 time in hold does not grow while open", later.probeHoldMs == s.probeHoldMs,
+		fmt.Sprintf("hold_ms=%d->%d", s.probeHoldMs, later.probeHoldMs))
 	r.quit("stale-probe")
 
 	r = newRig(cfg(""))
 	s = mustStats()
-	check("K6 restart forgets the previous probe result", s.lastProbeKB == -1, fmt.Sprintf("probe_kb=%d", s.lastProbeKB))
+	check("K6 restart forgets the previous probe result and state time", s.lastProbeKB == -1 && s.probeHoldMs == 0,
+		fmt.Sprintf("probe_kb=%d hold_ms=%d", s.lastProbeKB, s.probeHoldMs))
 	check("K6 probe off", probeOff() == 0, "")
 	r.quit("probe-reset")
 }

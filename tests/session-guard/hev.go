@@ -62,6 +62,7 @@ type sessionStats struct {
 	udpRelieved, tcpRelieved           uint64
 	udpRefusedAdm, tcpRefusedAdm       uint64
 	udpQueueDropped                    uint64
+	probeHoldMs, probeClosedMs         uint64
 }
 
 func startHev(cfg string, fd int) int {
@@ -116,12 +117,13 @@ func stats() (sessionStats, bool) {
 		udpLive: int(s.udp_live), tcpLive: int(s.tcp_live), dying: int(s.dying), udpQueued: int(s.udp_queued_frames),
 		admUDP: int(s.admission_udp), admTCP: int(s.admission_tcp), udpCap: int(s.udp_cap), tcpCap: int(s.tcp_cap),
 		lastProbeKB: int64(s.last_probe_kb),
-		udpCreated: uint64(s.udp_created), tcpCreated: uint64(s.tcp_created),
+		udpCreated:  uint64(s.udp_created), tcpCreated: uint64(s.tcp_created),
 		udpEvicted: uint64(s.udp_evicted), tcpEvicted: uint64(s.tcp_evicted),
 		udpRefused: uint64(s.udp_refused), tcpRefused: uint64(s.tcp_refused),
 		udpRelieved: uint64(s.udp_relieved), tcpRelieved: uint64(s.tcp_relieved),
 		udpRefusedAdm: uint64(s.udp_refused_adm), tcpRefusedAdm: uint64(s.tcp_refused_adm),
 		udpQueueDropped: uint64(s.udp_queue_dropped),
+		probeHoldMs:     uint64(s.probe_hold_ms), probeClosedMs: uint64(s.probe_closed_ms),
 	}, true
 }
 

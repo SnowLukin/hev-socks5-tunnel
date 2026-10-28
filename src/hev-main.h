@@ -265,6 +265,8 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * @*_relieved: sessions closed by hev_socks5_tunnel_relieve
  * @*_refused_adm: part of @*_refused due to HOLD or CLOSED admission
  * @udp_queue_dropped: datagrams dropped because a UDP queue was full
+ * @probe_hold_ms, @probe_closed_ms: time the memory probe has kept
+ *            HEV_SOCKS5_TUNNEL_ADMIT_HOLD and HEV_SOCKS5_TUNNEL_ADMIT_CLOSED
  */
 typedef struct
 {
@@ -284,6 +286,7 @@ typedef struct
     unsigned long long udp_relieved, tcp_relieved;
     unsigned long long udp_refused_adm, tcp_refused_adm;
     unsigned long long udp_queue_dropped;
+    unsigned long long probe_hold_ms, probe_closed_ms;
 } HevSocks5TunnelSessionStats;
 
 /**

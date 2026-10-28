@@ -133,6 +133,9 @@ static int64_t probe_next_ms;
 static HevSocks5TunnelProbe probe_cur;
 static int probe_state;
 static int64_t probe_last_kb = -1;
+/* Time spent in each probe state since the tunnel start, for stats. */
+static int64_t probe_state_ms[HEV_SOCKS5_TUNNEL_ADMIT_CLOSED + 1];
+static int64_t probe_state_since;
 
 #define YOUNG_RING 128
 static int64_t young_ring[YOUNG_RING];
@@ -331,6 +334,22 @@ young_count (int64_t now, int young_ms)
     return n;
 }
 
+static void
+probe_state_set (int state, int64_t now)
+{
+    int prev = probe_state;
+
+    if (state == prev)
+        return;
+
+    __atomic_fetch_add (&probe_state_ms[prev],
+                        now - __atomic_load_n (&probe_state_since,
+                                               __ATOMIC_RELAXED),
+                        __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_state_since, now, __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_state, state, __ATOMIC_RELAXED);
+}
+
 /*
  * Memory the process can still take, minus what sessions created in the last
  * young_ms are about to take: a new session reaches its full price only after
@@ -362,8 +381,7 @@ probe_update (int64_t now)
     avail_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
     prev = probe_state;
     if (!c->probe) {
-        __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
-                          __ATOMIC_RELAXED);
+        probe_state_set (HEV_SOCKS5_TUNNEL_ADMIT_OPEN, now);
         return HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
     }
     if (avail_kb < 0)
@@ -389,7 +407,7 @@ probe_update (int64_t now)
     if (state != prev) {
         LOG_W ("socks5 tunnel admission %d -> %d, available %lld KiB", prev,
                state, (long long)avail_kb);
-        __atomic_store_n (&probe_state, state, __ATOMIC_RELAXED);
+        probe_state_set (state, now);
     }
 
     return state;
@@ -1221,6 +1239,9 @@ session_limits_init (void)
 
     __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
                       __ATOMIC_RELAXED);
+    for (i = 0; i <= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED; i++)
+        __atomic_store_n (&probe_state_ms[i], 0, __ATOMIC_RELAXED);
+    __atomic_store_n (&probe_state_since, monotonic_ms (), __ATOMIC_RELAXED);
     __atomic_store_n (&probe_last_kb, -1, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_next_ms, 0, __ATOMIC_RELAXED);
     memset (young_ring, 0, sizeof (young_ring));
@@ -1558,6 +1579,18 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
             admission_for (i, __atomic_load_n (&probe_state, __ATOMIC_RELAXED));
     s.admission_udp = admission[SESSION_UDP];
     s.admission_tcp = admission[SESSION_TCP];
+    for (i = HEV_SOCKS5_TUNNEL_ADMIT_HOLD; i <= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED;
+         i++) {
+        int64_t ms = __atomic_load_n (&probe_state_ms[i], __ATOMIC_RELAXED);
+
+        if (__atomic_load_n (&probe_state, __ATOMIC_RELAXED) == i)
+            ms += monotonic_ms () -
+                  __atomic_load_n (&probe_state_since, __ATOMIC_RELAXED);
+        if (i == HEV_SOCKS5_TUNNEL_ADMIT_HOLD)
+            s.probe_hold_ms = ms;
+        else
+            s.probe_closed_ms = ms;
+    }
 
     *stats = s;
 
