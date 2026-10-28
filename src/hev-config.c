@@ -7,6 +7,8 @@
  ============================================================================
  */
 
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -341,6 +343,22 @@ hev_config_parse_log_level (const char *value)
 }
 
 static int
+hev_config_parse_misc_count (const char *key, const char *value, int fallback)
+{
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol (value, &end, 10);
+    if (errno || end == value || *end || v < 0 || v > INT_MAX) {
+        LOG_E ("config misc %s: %s is not a non-negative number", key, value);
+        return fallback;
+    }
+
+    return v;
+}
+
+static int
 hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
 {
     yaml_node_pair_t *pair;
@@ -396,25 +414,25 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
         else if (0 == strcmp (key, "limit-nofile"))
             limit_nofile = strtol (value, NULL, 10);
         else if (0 == strcmp (key, "udp-max-sessions"))
-            udp_max_sessions = strtoul (value, NULL, 10);
+            udp_max_sessions = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "tcp-max-sessions"))
-            tcp_max_sessions = strtoul (value, NULL, 10);
+            tcp_max_sessions = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "udp-evict-min-idle"))
-            udp_evict_min_idle = strtoul (value, NULL, 10);
+            udp_evict_min_idle = hev_config_parse_misc_count (key, value, 2000);
         else if (0 == strcmp (key, "tcp-evict-min-idle"))
-            tcp_evict_min_idle = strtoul (value, NULL, 10);
+            tcp_evict_min_idle = hev_config_parse_misc_count (key, value, 60000);
         else if (0 == strcmp (key, "udp-queue-frames"))
-            udp_queue_frames = strtoul (value, NULL, 10);
+            udp_queue_frames = hev_config_parse_misc_count (key, value, UDP_POOL_SIZE + 1);
         else if (0 == strcmp (key, "udp-queue-total-frames"))
-            udp_queue_total_frames = strtoul (value, NULL, 10);
+            udp_queue_total_frames = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "udp-evict-protect-age"))
-            udp_protect_age = strtoul (value, NULL, 10);
+            udp_protect_age = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "udp-evict-protect-idle"))
-            udp_protect_idle = strtoul (value, NULL, 10);
+            udp_protect_idle = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "tcp-evict-protect-age"))
-            tcp_protect_age = strtoul (value, NULL, 10);
+            tcp_protect_age = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "tcp-evict-protect-idle"))
-            tcp_protect_idle = strtoul (value, NULL, 10);
+            tcp_protect_idle = hev_config_parse_misc_count (key, value, 0);
     }
 
     if (udp_queue_frames <= 0 || udp_queue_frames > UDP_POOL_SIZE + 1)
