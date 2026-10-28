@@ -251,12 +251,12 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
 
 /**
  * hev_socks5_tunnel_set_dns_priority:
- * @max_sessions: size of the DNS pool, 0 turns DNS priority off, negative to
- *            restore misc.dns-priority-sessions
- * @timeout_ms: read-write timeout of a DNS session, zero or negative to
- *            restore misc.dns-priority-timeout (5000 if not set)
- * @addresses: comma separated IPv4 resolver addresses, at most 4; "" for any
- *            address, NULL to restore misc.dns-priority-addresses
+ * @max_sessions: size of the DNS pool up to 32, 0 turns DNS priority off,
+ *            negative to restore misc.dns-priority-sessions
+ * @timeout_ms: read-write timeout of a DNS session, 1000 to 10000, zero or
+ *            negative to restore misc.dns-priority-timeout (5000 if not set)
+ * @addresses: comma separated IPv4 resolver addresses, at most 4; "any" for
+ *            any address, NULL to restore misc.dns-priority-addresses
  *
  * New UDP flows to port 53 of these addresses go to a pool of their own: the
  * memory probe and the UDP cap do not apply to them, and they do not count
@@ -267,7 +267,11 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * Every tunnel start applies the configured values again. Safe to call from
  * any thread.
  *
- * Returns: zero, or -1 for an invalid address list.
+ * A full pool closes an answered session only after it has been silent for
+ * a second. An empty or invalid address list in the config turns the pool
+ * off.
+ *
+ * Returns: zero, or -1 for an invalid address list, size or timeout.
  */
 int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
                                         const char *addresses);
