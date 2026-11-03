@@ -486,15 +486,31 @@ refuse:
 }
 
 /*
+ * A session waits while its query has no reply yet, up to the time a resolver
+ * waits before it asks again. One that got a reply to every query is done: a
+ * lookup socket is mostly used once, and a long-lived resolver socket that
+ * asks again later simply gets a new session.
+ */
+static int
+dns_session_waiting (HevSocks5SessionData *sd, int64_t now)
+{
+    if (!sd->answered)
+        return now - sd->create_time < DNS_PRIORITY_GRACE_MS;
+    if (!sd->pending)
+        return 0;
+
+    return now - sd->active_time < DNS_PRIORITY_GRACE_MS;
+}
+
+/*
  * Name lookups get a small pool outside the memory probe and the UDP cap: in
  * a storm of new flows a lookup would otherwise lose to the storm, and every
- * new connection of the user fails before it starts. A full pool gives up an
- * answered session first, then one that waited longer than a resolver waits
- * for a reply. While all are young and unanswered the new query does not get
- * in: evicting them would let a flood of queries kill each one before its
- * reply. It then takes the ordinary UDP path, so a burst of lookups larger
- * than the pool, as when the tunnel starts, is limited by the UDP cap and the
- * memory probe and not dropped while there is room.
+ * new connection of the user fails before it starts. A full pool gives up a
+ * session that no longer waits for a reply. While all wait, the new query
+ * does not get in: evicting them would let a flood of queries kill each one
+ * before its reply. It then takes the ordinary UDP path, so a burst of
+ * lookups larger than the pool, as when the tunnel starts, is limited by the
+ * UDP cap and the memory probe and not dropped while there is room.
  */
 static int
 session_admit_dns (void)
@@ -513,9 +529,7 @@ session_admit_dns (void)
         HevSocks5SessionData *sd;
 
         sd = container_of (node, HevSocks5SessionData, node);
-        /* A long-lived resolver socket keeps its session while it talks. */
-        if (sd->answered ? now - sd->active_time < DNS_PRIORITY_GRACE_MS :
-                           now - sd->create_time < DNS_PRIORITY_GRACE_MS)
+        if (dns_session_waiting (sd, now))
             continue;
 
         session_kill (sd);
@@ -631,6 +645,7 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type)
     sd->active_time = sd->create_time;
     sd->type = type;
     sd->dying = 0;
+    sd->pending = 0;
     sd->timeout = 0;
     if (type == SESSION_DNS)
         sd->timeout =

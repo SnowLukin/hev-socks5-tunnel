@@ -687,7 +687,7 @@ func partDNSOverflow() {
 		ret == 0 && size == statsPoolSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
 
 	burst := func(tag string) (int, sessionStats, sessionStats) {
-		// Ответившие сессии пула вытесняются только после секунды тишины (F1).
+		// Пауза разводит пачки: ответы и отказы предыдущей уже дошли.
 		time.Sleep(1200 * time.Millisecond)
 		before := mustStats()
 		var cs []*gonet.UDPConn
@@ -732,8 +732,9 @@ func partDNSOverflow() {
 	r.quit("dns-overflow")
 }
 
-// F. Правки по ревью пула: ответивший долгий сокет не вытесняется, пока говорит (F1); пустой список
-// адресов выключает пул, "any" - любой адрес (F2); размер и таймаут в пределах (F8); маска relieve (F5).
+// F. Правки по ревью пула: ответившая сессия без ждущего запроса уступает место сразу, с ждущим -
+// через секунду (F1); пустой список адресов выключает пул, "any" - любой адрес (F2); размер и
+// таймаут в пределах (F8); маска relieve (F5).
 func partDNSReview() {
 	conf := "  dns-priority-sessions: 1\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9'\n"
 	r := newRig(cfg(conf))
@@ -745,9 +746,27 @@ func partDNSReview() {
 	q := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 	qok := udpEcho(q, "f1q")
 	s2 := mustStats()
-	check("F1 a talking answered session is not evicted, the query goes the ordinary way",
-		qok && s2.dnsEvicted == s.dnsEvicted && s2.dnsOverflow == s.dnsOverflow+1,
+	check("F1 an answered session with no query waiting gives up its place at once",
+		qok && s2.dnsEvicted == s.dnsEvicted+1 && s2.dnsOverflow == s.dnsOverflow,
 		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", qok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
+	// q ответила, теперь шлёт запрос без ответа: секунду её место держится.
+	q.Write([]byte("NOREPLY-f1"))
+	time.Sleep(50 * time.Millisecond)
+	s = mustStats()
+	q2 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+	q2ok := udpEcho(q2, "f1q2")
+	s2 = mustStats()
+	check("F1 an answered session with a query waiting keeps its place, the query goes the ordinary way",
+		q2ok && s2.dnsEvicted == s.dnsEvicted && s2.dnsOverflow == s.dnsOverflow+1,
+		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", q2ok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
+	time.Sleep(1200 * time.Millisecond)
+	s = mustStats()
+	q3 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+	q3ok := udpEcho(q3, "f1q3")
+	s2 = mustStats()
+	check("F1 a query waiting longer than a second no longer keeps the place",
+		q3ok && s2.dnsEvicted == s.dnsEvicted+1 && s2.dnsOverflow == s.dnsOverflow,
+		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", q3ok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
 	check("F5 relieve rejects unknown session kinds", relieve(reliefUDP|4, 0, 0) == -1, "")
 	check("F8 pool size over 32 is rejected", setDnsPriority(64, 0, nil) == -1, "")
 	check("F8 pool timeout below a second is rejected", setDnsPriority(1, 500, nil) == -1, "")

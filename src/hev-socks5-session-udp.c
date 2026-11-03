@@ -303,6 +303,7 @@ hev_socks5_session_udp_fwd_b (HevSocks5SessionUDP *self, char *buf,
         }
 
         self->data.answered = 1;
+        self->data.pending -= (n < self->data.pending) ? n : self->data.pending;
     }
 
     return 1;
@@ -365,6 +366,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
 
     self->frames++;
+    self->data.pending++;
     queued_total_add (1);
     hev_list_add_tail (&self->frame_list, &frame->node);
     hev_task_wakeup (self->data.task);

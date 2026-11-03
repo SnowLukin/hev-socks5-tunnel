@@ -33,6 +33,8 @@ struct _HevSocks5SessionData
     int type;
     int dying;
     int answered;
+    /* UDP: datagrams from the app not yet matched by a reply. */
+    int pending;
     /* Replaces the UDP read-write timeout after the handshake if > 0. */
     int timeout;
 };
