@@ -304,7 +304,8 @@ session_lru (int type)
  * download never goes silent, a one-shot flow does. An established
  * conversation (got a reply and lived protect_age) keeps its place until it
  * is silent protect_idle, so a keep-alive every few seconds survives a storm
- * of one-shot flows.
+ * of one-shot flows. A lookup that did not fit in the DNS pool is a one-shot
+ * flow even after its reply.
  */
 static int
 session_evict_idle (int type, int64_t now)
@@ -325,7 +326,7 @@ session_evict_idle (int type, int64_t now)
         sd = container_of (node, HevSocks5SessionData, node);
         if (now - sd->active_time < idle_ms)
             break;
-        if (protect_age > 0 && sd->answered &&
+        if (protect_age > 0 && sd->answered && !sd->lookup &&
             now - sd->create_time >= protect_age &&
             now - sd->active_time < protect_idle)
             continue;
@@ -636,7 +637,7 @@ session_rotate (void)
 }
 
 static void
-hev_socks5_tunnel_insert_session (HevListNode *node, int type)
+hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
 {
     HevSocks5SessionData *sd;
 
@@ -646,8 +647,9 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type)
     sd->type = type;
     sd->dying = 0;
     sd->pending = 0;
+    sd->lookup = lookup;
     sd->timeout = 0;
-    if (type == SESSION_DNS)
+    if (lookup)
         sd->timeout =
             __atomic_load_n (&dns_priority_timeout_ms, __ATOMIC_RELAXED);
 
@@ -773,7 +775,7 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node, SESSION_TCP);
+    hev_socks5_tunnel_insert_session (node, SESSION_TCP, 0);
     hev_task_run (task, hev_socks5_session_task_entry, tcp);
     hev_task_wakeup (task_lwip_timer);
 
@@ -840,7 +842,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevMappedDNS *dns;
     int stack_size;
     HevTask *task;
-    int type, overflow;
+    int type, lookup, overflow;
 
     if (!READ_ONCE (run)) {
         udp_refuse (pcb);
@@ -867,7 +869,8 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     /* Admission may evict a session, so it goes after the allocation. */
     type = SESSION_UDP;
     overflow = 0;
-    if (dns_priority_match (addr, port)) {
+    lookup = dns_priority_match (addr, port);
+    if (lookup) {
         if (session_admit_dns () == 0)
             type = SESSION_DNS;
         else
@@ -888,7 +891,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node, type);
+    hev_socks5_tunnel_insert_session (node, type, lookup);
     if (overflow)
         stat_inc (&stat_dns_overflow);
     hev_task_run (task, hev_socks5_session_task_entry, udp);

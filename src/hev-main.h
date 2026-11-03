@@ -263,9 +263,10 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * against the UDP cap. A full pool makes room by closing a session that has a
  * reply to every query, or one whose query has waited a second without a
  * reply; if all still wait, the new query takes the ordinary UDP path, where
- * the UDP cap and the memory probe apply. Live sessions keep the timeout they started with.
- * Every tunnel start applies the configured values again. Safe to call from
- * any thread.
+ * the UDP cap and the memory probe apply. There it keeps the pool timeout and
+ * is not protected from eviction as an established flow. Live sessions keep
+ * the timeout they started with. Every tunnel start applies the configured
+ * values again. Safe to call from any thread.
  *
  * An empty or invalid address list in the config turns the pool off.
  *

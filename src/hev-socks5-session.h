@@ -35,6 +35,8 @@ struct _HevSocks5SessionData
     int answered;
     /* UDP: datagrams from the app not yet matched by a reply. */
     int pending;
+    /* A lookup to a pool resolver, in the pool or over it. */
+    int lookup;
     /* Replaces the UDP read-write timeout after the handshake if > 0. */
     int timeout;
 };
