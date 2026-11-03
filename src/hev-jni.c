@@ -57,15 +57,22 @@ static jboolean native_start_service (JNIEnv *env, jobject thiz,
                                       jstring conig_path, jint fd);
 static jboolean native_stop_service (JNIEnv *env, jobject thiz);
 static jboolean native_is_running (JNIEnv *env, jobject thiz);
+static void native_start_service_void (JNIEnv *env, jobject thiz,
+                                       jstring config_path, jint fd);
+static void native_stop_service_void (JNIEnv *env, jobject thiz);
 static jlongArray native_get_stats (JNIEnv *env, jobject thiz);
 static void native_configure_log_history (JNIEnv *env, jobject thiz,
                                           jstring json);
 static jstring native_get_log_history_state (JNIEnv *env, jobject thiz);
 
 static JNINativeMethod native_methods[] = {
-    { "TProxyStartService", "(Ljava/lang/String;I)Z",
-      (void *)native_start_service },
-    { "TProxyStopService", "()Z", (void *)native_stop_service },
+    /*
+     * The Android wrapper and the prebuilt AmneziaWG AAR call start and stop
+     * with void signatures; TProxyIsRunning reports the start result instead.
+     */
+    { "TProxyStartService", "(Ljava/lang/String;I)V",
+      (void *)native_start_service_void },
+    { "TProxyStopService", "()V", (void *)native_stop_service_void },
     { "TProxyIsRunning", "()Z", (void *)native_is_running },
     { "TProxyGetStats", "()[J", (void *)native_get_stats },
     { "ConfigureLogHistory", "(Ljava/lang/String;)V",
@@ -318,6 +325,19 @@ native_stop_service (JNIEnv *env, jobject thiz)
 exit:
     pthread_mutex_unlock (&mutex);
     return res == 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+static void
+native_start_service_void (JNIEnv *env, jobject thiz, jstring config_path,
+                           jint fd)
+{
+    native_start_service (env, thiz, config_path, fd);
+}
+
+static void
+native_stop_service_void (JNIEnv *env, jobject thiz)
+{
+    native_stop_service (env, thiz);
 }
 
 static jboolean
