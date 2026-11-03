@@ -33,6 +33,10 @@ struct _HevSocks5SessionData
     int type;
     int dying;
     int answered;
+    /* UDP: datagrams from the app not yet matched by a reply. */
+    int pending;
+    /* A lookup to a pool resolver, in the pool or over it. */
+    int lookup;
     /* Replaces the UDP read-write timeout after the handshake if > 0. */
     int timeout;
 };
@@ -49,6 +53,7 @@ void *hev_socks5_session_iface (void);
 
 void hev_socks5_session_run (HevSocks5Session *self);
 void hev_socks5_session_terminate (HevSocks5Session *self);
+int hev_socks5_session_idle_wait (HevSocks5Session *self, int released);
 
 void hev_socks5_session_set_task (HevSocks5Session *self, HevTask *task);
 HevListNode *hev_socks5_session_get_node (HevSocks5Session *self);

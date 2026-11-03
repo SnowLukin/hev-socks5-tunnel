@@ -145,6 +145,7 @@ static void
 expect_partial_tcp_frame_stops_receive (HevTaskMutex *mutex, int ending)
 {
     HevSocks5SessionUDP *session;
+    char buf[UDP_BUF_SIZE * 2];
     int fd[2], flags;
 
     begin_history ();
@@ -164,7 +165,7 @@ expect_partial_tcp_frame_stops_receive (HevTaskMutex *mutex, int ending)
     else
         hev_socks5_session_terminate (HEV_SOCKS5_SESSION (session));
 
-    assert (hev_socks5_session_udp_fwd_b (session, 2) < 0);
+    assert (hev_socks5_session_udp_fwd_b (session, buf, UDP_BUF_SIZE, 2) < 0);
     if (ending == 2) {
         read_history ();
         assert (!strstr (records, "socks5 failure"));

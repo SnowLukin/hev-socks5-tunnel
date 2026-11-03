@@ -2,7 +2,8 @@
 // Часть 1 - проверки r8: relieve, гонка relieve с остановкой.
 // Часть 3 - пул DNS (0009, 0011): D - пул под потолком UDP, HOLD и CLOSED, адреса из списка и мимо
 // него, вытеснение и отказ в полном пуле, свой таймаут, сеттер, старый размер статистики; D6 - запрос
-// сверх полного пула идёт обычным путём UDP; F - правки по ревью пула.
+// сверх полного пула идёт обычным путём UDP; O - такой запрос живёт по таймауту пула и без защиты
+// установившихся; F - правки по ревью пула.
 // Часть 2 - guard: потолки из конфига, вытеснение молчащих, отказ TCP сбросом, внешний приём,
 // колбэк памяти (CLOSED / HOLD / OPEN с гистерезисом, типы колбэка), защита установившихся из
 // ключей конфига (патч 0008) и повторное чтение конфига на перезапуске, размер статистики.
@@ -687,7 +688,7 @@ func partDNSOverflow() {
 		ret == 0 && size == statsPoolSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
 
 	burst := func(tag string) (int, sessionStats, sessionStats) {
-		// Ответившие сессии пула вытесняются только после секунды тишины (F1).
+		// Пауза разводит пачки: ответы и отказы предыдущей уже дошли.
 		time.Sleep(1200 * time.Millisecond)
 		before := mustStats()
 		var cs []*gonet.UDPConn
@@ -732,8 +733,59 @@ func partDNSOverflow() {
 	r.quit("dns-overflow")
 }
 
-// F. Правки по ревью пула: ответивший долгий сокет не вытесняется, пока говорит (F1); пустой список
-// адресов выключает пул, "any" - любой адрес (F2); размер и таймаут в пределах (F8); маска relieve (F5).
+// O. Запрос сверх пула, ставший обычной сессией UDP, живёт по таймауту пула (O1) и не попадает под
+// защиту установившихся (O2). Потолок UDP и колбэк памяти к нему применяются как раньше (D6).
+func partDNSOverflowSession() {
+	// Пул 1 на 9.9.9.9 с таймаутом 2 с, read-write-timeout обычного UDP 30 с. Потолок UDP 2,
+	// ответившие потоки старше 0.1 с защищены от вытеснения минуту.
+	conf := "  udp-max-sessions: 2\n  udp-evict-min-idle: 500\n" +
+		"  udp-evict-protect-age: 100\n  udp-evict-protect-idle: 60000\n" +
+		"  dns-priority-sessions: 1\n  dns-priority-timeout: 2000\n  dns-priority-addresses: '9.9.9.9'\n"
+	var r *rig
+	// Пул занят молодым запросом без ответа, следующий запрос идёт мимо пула.
+	overflow := func(tag string) (bool, sessionStats, sessionStats) {
+		hold := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+		hold.Write([]byte("NOREPLY-" + tag))
+		time.Sleep(50 * time.Millisecond)
+		before := mustStats()
+		ov := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+		ok := udpEcho(ov, tag)
+		return ok, before, mustStats()
+	}
+
+	r = newRig(cfg(conf))
+	ok, b, s := overflow("o1")
+	check("O1 a query over a full pool starts as an ordinary udp session",
+		ok && s.dnsOverflow == b.dnsOverflow+1 && s.udpLive == b.udpLive+1,
+		fmt.Sprintf("echo=%v overflow=%d->%d udp_live=%d->%d", ok, b.dnsOverflow, s.dnsOverflow, b.udpLive, s.udpLive))
+	time.Sleep(2700 * time.Millisecond)
+	s = mustStats()
+	check("O1 that session times out after dns-priority-timeout, not read-write-timeout",
+		s.udpLive == b.udpLive && s.dnsLive == 0, fmt.Sprintf("udp_live=%d dns_live=%d", s.udpLive, s.dnsLive))
+	r.quit("dns-overflow-timeout")
+
+	r = newRig(cfg(conf))
+	ok, _, _ = overflow("o2")
+	plain := r.openUDP(1, 25000)
+	pok := udpEcho(plain[0], "o2p")
+	s = mustStats()
+	check("O2 the overflow session and an ordinary flow fill the udp cap",
+		ok && pok && s.udpLive == 2, fmt.Sprintf("echo=%v/%v udp_live=%d", ok, pok, s.udpLive))
+	// Оба ответили и молчат дольше udp-evict-min-idle: обычный поток защищён, переполнение - нет.
+	time.Sleep(700 * time.Millisecond)
+	b = mustStats()
+	next := r.openUDP(1, 25100)
+	nok := udpEcho(next[0], "o2n")
+	s = mustStats()
+	check("O2 a new flow takes the place of the silent overflow session, the protected flow stays",
+		nok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 2 && udpEcho(plain[0], "o2p2"),
+		fmt.Sprintf("echo=%v evicted=%d->%d udp_live=%d", nok, b.udpEvicted, s.udpEvicted, s.udpLive))
+	r.quit("dns-overflow-protect")
+}
+
+// F. Правки по ревью пула: ответившая сессия без ждущего запроса уступает место сразу, с ждущим -
+// через секунду (F1); пустой список адресов выключает пул, "any" - любой адрес (F2); размер и
+// таймаут в пределах (F8); маска relieve (F5).
 func partDNSReview() {
 	conf := "  dns-priority-sessions: 1\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9'\n"
 	r := newRig(cfg(conf))
@@ -745,9 +797,27 @@ func partDNSReview() {
 	q := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 	qok := udpEcho(q, "f1q")
 	s2 := mustStats()
-	check("F1 a talking answered session is not evicted, the query goes the ordinary way",
-		qok && s2.dnsEvicted == s.dnsEvicted && s2.dnsOverflow == s.dnsOverflow+1,
+	check("F1 an answered session with no query waiting gives up its place at once",
+		qok && s2.dnsEvicted == s.dnsEvicted+1 && s2.dnsOverflow == s.dnsOverflow,
 		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", qok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
+	// q ответила, теперь шлёт запрос без ответа: секунду её место держится.
+	q.Write([]byte("NOREPLY-f1"))
+	time.Sleep(50 * time.Millisecond)
+	s = mustStats()
+	q2 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+	q2ok := udpEcho(q2, "f1q2")
+	s2 = mustStats()
+	check("F1 an answered session with a query waiting keeps its place, the query goes the ordinary way",
+		q2ok && s2.dnsEvicted == s.dnsEvicted && s2.dnsOverflow == s.dnsOverflow+1,
+		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", q2ok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
+	time.Sleep(1200 * time.Millisecond)
+	s = mustStats()
+	q3 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
+	q3ok := udpEcho(q3, "f1q3")
+	s2 = mustStats()
+	check("F1 a query waiting longer than a second no longer keeps the place",
+		q3ok && s2.dnsEvicted == s.dnsEvicted+1 && s2.dnsOverflow == s.dnsOverflow,
+		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", q3ok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
 	check("F5 relieve rejects unknown session kinds", relieve(reliefUDP|4, 0, 0) == -1, "")
 	check("F8 pool size over 32 is rejected", setDnsPriority(64, 0, nil) == -1, "")
 	check("F8 pool timeout below a second is rejected", setDnsPriority(1, 500, nil) == -1, "")
@@ -774,6 +844,7 @@ func main() {
 	partReview()
 	partDNS()
 	partDNSOverflow()
+	partDNSOverflowSession()
 	partDNSReview()
 	fmt.Printf("SUMMARY pass=%d fail=%d\n", passed, failed)
 	if failed > 0 {

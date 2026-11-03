@@ -260,16 +260,15 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  *
  * New UDP flows to port 53 of these addresses go to a pool of their own: the
  * memory probe and the UDP cap do not apply to them, and they do not count
- * against the UDP cap. A full pool makes room by closing an answered session,
- * or one older than a second without a reply; if all are younger and
- * unanswered the new query takes the ordinary UDP path, where the UDP cap and
- * the memory probe apply. Live sessions keep the timeout they started with.
- * Every tunnel start applies the configured values again. Safe to call from
- * any thread.
+ * against the UDP cap. A full pool makes room by closing a session that has a
+ * reply to every query, or one whose query has waited a second without a
+ * reply; if all still wait, the new query takes the ordinary UDP path, where
+ * the UDP cap and the memory probe apply. There it keeps the pool timeout and
+ * is not protected from eviction as an established flow. Live sessions keep
+ * the timeout they started with. Every tunnel start applies the configured
+ * values again. Safe to call from any thread.
  *
- * A full pool closes an answered session only after it has been silent for
- * a second. An empty or invalid address list in the config turns the pool
- * off.
+ * An empty or invalid address list in the config turns the pool off.
  *
  * Returns: zero, or -1 for an invalid address list, size or timeout.
  */
@@ -297,7 +296,7 @@ int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
  * @dns_live, @dns_cap: live sessions in the DNS pool and its size, 0 if off
  * @dns_created, @dns_evicted, @dns_refused: DNS pool sessions created,
  *            closed to make room, and queries that found the pool full of
- *            young unanswered sessions
+ *            sessions waiting for a reply
  * @dns_overflow: part of @dns_refused that started as ordinary UDP sessions;
  *            the rest was refused by the UDP cap or the memory probe
  *

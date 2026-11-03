@@ -1,5 +1,6 @@
 // Мини SOCKS5-сервер для стенда hev: CONNECT и UDP ASSOCIATE.
 // CONNECT: порт 19 - бесконечный поток (chargen), порт 9 - discard, иначе echo.
+// UDP: echo, кроме датаграмм с префиксом NOREPLY.
 // UDP: эхо; если payload начинается с "SHORT" - дополнительно шлёт клиенту датаграмму из 2 байт,
 // если с "EMPTY" - датаграмму нулевой длины.
 package main
@@ -128,6 +129,10 @@ func handle(c net.Conn) {
 					continue
 				}
 				payload := p[3+len(raw):]
+				// Запрос без ответа: так сессия hev остаётся с запросом, который ждёт ответа.
+				if len(payload) >= 7 && string(payload[:7]) == "NOREPLY" {
+					continue
+				}
 				out := append([]byte{0, 0, 0}, raw...)
 				out = append(out, payload...)
 				pc.WriteToUDP(out, from)

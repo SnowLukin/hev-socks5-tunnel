@@ -18,6 +18,10 @@
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #include <lwip/tcp.h>
 #include <lwip/udp.h>
 #include <lwip/nd6.h>
@@ -205,6 +209,9 @@ netif_output_handler (struct netif *netif, struct pbuf *p)
     if (s <= 0) {
         if (errno == EAGAIN)
             return ERR_WOULDBLOCK;
+        /* Large packets may not fit, lwIP sends smaller ones then. */
+        if ((errno == ENOBUFS) || (errno == ENOMEM))
+            return ERR_MEM;
         LOG_W ("socks5 tunnel write");
         return ERR_IF;
     }
@@ -297,7 +304,8 @@ session_lru (int type)
  * download never goes silent, a one-shot flow does. An established
  * conversation (got a reply and lived protect_age) keeps its place until it
  * is silent protect_idle, so a keep-alive every few seconds survives a storm
- * of one-shot flows.
+ * of one-shot flows. A lookup that did not fit in the DNS pool is a one-shot
+ * flow even after its reply.
  */
 static int
 session_evict_idle (int type, int64_t now)
@@ -318,7 +326,7 @@ session_evict_idle (int type, int64_t now)
         sd = container_of (node, HevSocks5SessionData, node);
         if (now - sd->active_time < idle_ms)
             break;
-        if (protect_age > 0 && sd->answered &&
+        if (protect_age > 0 && sd->answered && !sd->lookup &&
             now - sd->create_time >= protect_age &&
             now - sd->active_time < protect_idle)
             continue;
@@ -479,15 +487,31 @@ refuse:
 }
 
 /*
+ * A session waits while its query has no reply yet, up to the time a resolver
+ * waits before it asks again. One that got a reply to every query is done: a
+ * lookup socket is mostly used once, and a long-lived resolver socket that
+ * asks again later simply gets a new session.
+ */
+static int
+dns_session_waiting (HevSocks5SessionData *sd, int64_t now)
+{
+    if (!sd->answered)
+        return now - sd->create_time < DNS_PRIORITY_GRACE_MS;
+    if (!sd->pending)
+        return 0;
+
+    return now - sd->active_time < DNS_PRIORITY_GRACE_MS;
+}
+
+/*
  * Name lookups get a small pool outside the memory probe and the UDP cap: in
  * a storm of new flows a lookup would otherwise lose to the storm, and every
- * new connection of the user fails before it starts. A full pool gives up an
- * answered session first, then one that waited longer than a resolver waits
- * for a reply. While all are young and unanswered the new query does not get
- * in: evicting them would let a flood of queries kill each one before its
- * reply. It then takes the ordinary UDP path, so a burst of lookups larger
- * than the pool, as when the tunnel starts, is limited by the UDP cap and the
- * memory probe and not dropped while there is room.
+ * new connection of the user fails before it starts. A full pool gives up a
+ * session that no longer waits for a reply. While all wait, the new query
+ * does not get in: evicting them would let a flood of queries kill each one
+ * before its reply. It then takes the ordinary UDP path, so a burst of
+ * lookups larger than the pool, as when the tunnel starts, is limited by the
+ * UDP cap and the memory probe and not dropped while there is room.
  */
 static int
 session_admit_dns (void)
@@ -506,9 +530,7 @@ session_admit_dns (void)
         HevSocks5SessionData *sd;
 
         sd = container_of (node, HevSocks5SessionData, node);
-        /* A long-lived resolver socket keeps its session while it talks. */
-        if (sd->answered ? now - sd->active_time < DNS_PRIORITY_GRACE_MS :
-                           now - sd->create_time < DNS_PRIORITY_GRACE_MS)
+        if (dns_session_waiting (sd, now))
             continue;
 
         session_kill (sd);
@@ -615,7 +637,7 @@ session_rotate (void)
 }
 
 static void
-hev_socks5_tunnel_insert_session (HevListNode *node, int type)
+hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
 {
     HevSocks5SessionData *sd;
 
@@ -624,8 +646,10 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type)
     sd->active_time = sd->create_time;
     sd->type = type;
     sd->dying = 0;
+    sd->pending = 0;
+    sd->lookup = lookup;
     sd->timeout = 0;
-    if (type == SESSION_DNS)
+    if (lookup)
         sd->timeout =
             __atomic_load_n (&dns_priority_timeout_ms, __ATOMIC_RELAXED);
 
@@ -693,6 +717,23 @@ hev_socks5_session_task_entry (void *data)
     hev_object_unref (HEV_OBJECT (s));
 }
 
+static void
+tcp_pcb_set_gso (struct tcp_pcb *pcb)
+{
+    /* Leave room for IP and TCP headers within the 64K packet limit. */
+    const unsigned int max = 65535 - 128;
+    unsigned int n = (max + pcb->mss - 1) / pcb->mss;
+
+    /*
+     * Send super segments of n segments, the tunnel device segments them
+     * into packets of gso_mss on demand (GSO), or they are delivered as is
+     * (jumbo). The segments are shrunk evenly to fill up the 64K limit, so
+     * a 64K buffer goes out as one packet instead of a full and a small one.
+     */
+    pcb->gso_mss = max / n;
+    pcb->mss = n * pcb->gso_mss;
+}
+
 static err_t
 tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 {
@@ -728,9 +769,13 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_MEM;
     }
 
+    if (hev_tunnel_get_offload () &
+        (HEV_TUNNEL_OFFLOAD_TCP | HEV_TUNNEL_OFFLOAD_JUMBO))
+        tcp_pcb_set_gso (pcb);
+
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node, SESSION_TCP);
+    hev_socks5_tunnel_insert_session (node, SESSION_TCP, 0);
     hev_task_run (task, hev_socks5_session_task_entry, tcp);
     hev_task_wakeup (task_lwip_timer);
 
@@ -797,7 +842,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevMappedDNS *dns;
     int stack_size;
     HevTask *task;
-    int type, overflow;
+    int type, lookup, overflow;
 
     if (!READ_ONCE (run)) {
         udp_refuse (pcb);
@@ -824,7 +869,8 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     /* Admission may evict a session, so it goes after the allocation. */
     type = SESSION_UDP;
     overflow = 0;
-    if (dns_priority_match (addr, port)) {
+    lookup = dns_priority_match (addr, port);
+    if (lookup) {
         if (session_admit_dns () == 0)
             type = SESSION_DNS;
         else
@@ -845,7 +891,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node, type);
+    hev_socks5_tunnel_insert_session (node, type, lookup);
     if (overflow)
         stat_inc (&stat_dns_overflow);
     hev_task_run (task, hev_socks5_session_task_entry, udp);
@@ -941,17 +987,42 @@ event_task_entry (void *data)
     hev_task_del_fd (task_event, event_fds[0]);
 }
 
+/*
+ * Packets are read into MTU-sized pbufs. The ones that are queued by a
+ * session would pin the whole buffer, so small packets are moved into a
+ * pbuf that fits them.
+ */
+static struct pbuf *
+tunnel_compact_pbuf (struct pbuf *buf)
+{
+    struct pbuf *p;
+
+    if (buf->next || (buf->tot_len > COMPACT_PBUF_SIZE))
+        return buf;
+
+    p = pbuf_alloc (PBUF_RAW, buf->tot_len, PBUF_RAM);
+    if (!p)
+        return buf;
+
+    memcpy (p->payload, buf->payload, buf->tot_len);
+    pbuf_free (buf);
+
+    return p;
+}
+
 static void
 lwip_io_task_entry (void *data)
 {
     const unsigned int mtu = hev_config_get_tunnel_mtu ();
+    unsigned int i;
 
     LOG_D ("socks5 tunnel lwip task run");
 
     hev_tunnel_add_task (tun_fd, task_lwip_io);
 
-    for (; READ_ONCE (run);) {
+    for (i = 0; READ_ONCE (run);) {
         struct pbuf *buf;
+        uint8_t *data;
 
         buf = hev_tunnel_read (tun_fd, mtu, task_io_yielder, NULL);
         if (!buf)
@@ -960,10 +1031,26 @@ lwip_io_task_entry (void *data)
         stat_tx_packets++;
         stat_tx_bytes += buf->tot_len;
 
+        buf = tunnel_compact_pbuf (buf);
+
+        data = buf->payload;
+        if ((data[0] >> 4) == 4 ? (data[9] == IP_PROTO_UDP) :
+                                  (data[6] == IP_PROTO_UDP))
+            i++;
+
         hev_task_mutex_lock (&mutex);
         if (netif->input (buf, netif) != ERR_OK)
             pbuf_free (buf);
         hev_task_mutex_unlock (&mutex);
+
+        /*
+         * Let the UDP sessions forward what has been received so far, instead
+         * of reading packets that will be dropped by full session queues.
+         */
+        if (i >= TUN_READ_BATCH) {
+            hev_task_yield (HEV_TASK_YIELD);
+            i = 0;
+        }
     }
 
     hev_tunnel_del_task (tun_fd, task_lwip_io);
@@ -998,6 +1085,10 @@ lwip_timer_task_entry (void *data)
             probe_update (monotonic_ms ());
             hev_task_sleep (TCP_TMR_INTERVAL);
         } else {
+#if defined(__GLIBC__) && !defined(ENABLE_LIBRARY)
+            /* Release free memory from the heap */
+            malloc_trim (0);
+#endif
             hev_task_yield (HEV_TASK_WAITIO);
         }
     }
@@ -1007,8 +1098,10 @@ static int
 tunnel_init (int extern_tun_fd)
 {
     const char *script_path, *name, *guid, *ipv4, *ipv6;
-    int multi_queue, res;
+    int multi_queue, offload, res;
     unsigned int mtu;
+
+    offload = hev_config_get_tunnel_offload ();
 
     if (extern_tun_fd >= 0) {
         int nonblock = 1;
@@ -1020,6 +1113,7 @@ tunnel_init (int extern_tun_fd)
         }
 
         tun_fd = extern_tun_fd;
+        hev_tunnel_set_offload (tun_fd, offload);
         return 0;
     }
 
@@ -1032,6 +1126,7 @@ tunnel_init (int extern_tun_fd)
         LOG_E ("socks5 tunnel open (%s)", strerror (errno));
         return -1;
     }
+    hev_tunnel_set_offload (tun_fd, offload);
 
     mtu = hev_config_get_tunnel_mtu ();
     res = hev_tunnel_set_mtu (mtu);
@@ -1118,6 +1213,11 @@ gateway_init (void)
     netif_set_default (netif);
     netif_set_flags (netif, NETIF_FLAG_PRETEND_TCP);
     netif_set_flags (netif, NETIF_FLAG_PRETEND_UDP);
+
+    if (hev_tunnel_get_offload () & HEV_TUNNEL_OFFLOAD_CSUM)
+        NETIF_SET_CHECKSUM_CTRL (netif, NETIF_CHECKSUM_ENABLE_ALL &
+                                            ~(NETIF_CHECKSUM_GEN_TCP |
+                                              NETIF_CHECKSUM_GEN_UDP));
 
     if (hev_config_get_tunnel_icmp ())
         netif_set_flags (netif, NETIF_FLAG_PRETEND_ICMP);
