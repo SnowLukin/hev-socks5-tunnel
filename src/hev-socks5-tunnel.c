@@ -1313,11 +1313,10 @@ event_task_fini (void)
 static int
 relief_task_init (void)
 {
-    int nonblock = 1;
     int fds[2];
     int res;
 
-    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, fds);
+    res = hev_task_io_socket_socketpair (PF_LOCAL, SOCK_STREAM, 0, fds);
     if (res < 0) {
         LOG_E ("socks5 tunnel relief");
         return -1;
@@ -1328,15 +1327,9 @@ relief_task_init (void)
     relief_fds[1] = fds[1];
     pthread_mutex_unlock (&relief_mutex);
 
-    res = ioctl (relief_fds[0], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel relief nonblock");
-        return -1;
-    }
-
-    res = ioctl (relief_fds[1], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel relief nonblock");
+    if ((hev_task_io_fcntl (relief_fds[0], F_SETFD, FD_CLOEXEC) < 0) ||
+        (hev_task_io_fcntl (relief_fds[1], F_SETFD, FD_CLOEXEC) < 0)) {
+        LOG_E ("socks5 tunnel relief cloexec");
         return -1;
     }
 
@@ -1360,11 +1353,11 @@ relief_task_fini (void)
     /* Under the lock: a concurrent relieve must not write to a closed fd. */
     pthread_mutex_lock (&relief_mutex);
     if (relief_fds[0] >= 0) {
-        close (relief_fds[0]);
+        hev_task_io_close (relief_fds[0]);
         relief_fds[0] = -1;
     }
     if (relief_fds[1] >= 0) {
-        close (relief_fds[1]);
+        hev_task_io_close (relief_fds[1]);
         relief_fds[1] = -1;
     }
     pthread_mutex_unlock (&relief_mutex);
@@ -1670,7 +1663,8 @@ hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
 
     pthread_mutex_lock (&relief_mutex);
     if (relief_fds[1] >= 0)
-        res = write (relief_fds[1], &relief, sizeof (relief));
+        res = hev_task_io_write (relief_fds[1], &relief, sizeof (relief),
+                                 hev_task_io_nowait, NULL);
     pthread_mutex_unlock (&relief_mutex);
 
     if (res != sizeof (relief))
@@ -1912,7 +1906,7 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     return 0;
 }
 
-void
+EXPORT_SYMBOL void
 hev_socks5_tunnel_stats (size_t *tx_packets, size_t *tx_bytes,
                          size_t *rx_packets, size_t *rx_bytes)
 {
