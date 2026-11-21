@@ -61,7 +61,8 @@ tcp_splice_f (HevSocks5SessionTCP *self)
     }
 
     if (iovc) {
-        ssize_t s = writev (HEV_SOCKS5 (self)->fd, iov, iovc);
+        ssize_t s = hev_task_io_writev (HEV_SOCKS5 (self)->fd, iov, iovc,
+                                        hev_task_io_nowait, NULL);
         int error = errno;
         if (0 >= s) {
             if ((0 > s) && (EAGAIN == error))
@@ -86,7 +87,7 @@ tcp_splice_f (HevSocks5SessionTCP *self)
             res = 1;
         }
     } else if (res < 0) {
-        shutdown (HEV_SOCKS5 (self)->fd, SHUT_WR);
+        hev_task_io_socket_shutdown (HEV_SOCKS5 (self)->fd, SHUT_WR);
     }
 
     return res;
@@ -101,7 +102,8 @@ tcp_splice_b (HevSocks5SessionTCP *self)
 
     iovc = hev_ring_buffer_writing (self->buffer, iov);
     if (iovc) {
-        ssize_t s = readv (HEV_SOCKS5 (self)->fd, iov, iovc);
+        ssize_t s = hev_task_io_readv (HEV_SOCKS5 (self)->fd, iov, iovc,
+                                       hev_task_io_nowait, NULL);
         int error = errno;
         if (0 >= s) {
             if ((0 > s) && (EAGAIN == error))
@@ -169,6 +171,10 @@ tcp_recv_handler (void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
     HevSocks5SessionTCP *self = arg;
 
     if (p) {
+        /* Don't delay the ACK, it stalls small writes with Nagle on. */
+        if (p->flags & PBUF_FLAG_PUSH)
+            tcp_set_flags (pcb, TF_ACK_NOW);
+
         if (self->queue)
             pbuf_cat (self->queue, p);
         else
