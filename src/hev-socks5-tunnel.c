@@ -15,8 +15,8 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <stddef.h>
-#include <sys/ioctl.h>
 #include <arpa/inet.h>
+#include <hev-sys.h>
 
 #ifdef __GLIBC__
 #include <malloc.h>
@@ -32,13 +32,16 @@
 
 #include <hev-task.h>
 #include <hev-task-io.h>
+#include <hev-task-io-socket.h>
 #include <hev-task-mutex.h>
 #include <hev-task-system.h>
 #include <hev-memory-allocator.h>
 
 #include "hev-exec.h"
 #include "hev-config.h"
+#include "hev-utils.h"
 #include "hev-logger.h"
+#include "hev-compat.h"
 #include "hev-tunnel.h"
 #include "hev-compiler.h"
 #include "hev-mapped-dns.h"
@@ -749,8 +752,9 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_RST;
 
     /*
-     * The task goes first: unref of a session that has no task takes the
-     * mutex the lwIP task already holds, and admission may evict a session.
+     * The task goes first: the session can't be destroyed here, its destructor
+     * takes the mutex that is held while lwIP calls us. Admission may evict a
+     * session, so it goes after the allocation too.
      */
     stack_size = hev_config_get_misc_task_stack_size ();
     task = hev_task_new (stack_size);
@@ -812,25 +816,17 @@ exit:
     udp_remove (pcb);
 }
 
+/*
+ * The datagram that created the pcb is delivered to it after we return. The
+ * pcb must not be removed before, lwIP would create a new one for it again.
+ */
 static void
-udp_refuse_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
-                    const ip_addr_t *addr, u16_t port)
+udp_drop_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                  const ip_addr_t *addr, u16_t port)
 {
     pbuf_free (p);
     udp_recv (pcb, NULL, NULL);
     udp_remove (pcb);
-}
-
-/*
- * lwIP hands the listener a fresh pcb and then looks the datagram up again.
- * Removing that pcb here would make lwIP create the next one and call the
- * listener again forever, so a refused datagram is dropped on the second
- * lookup instead, like the mapped DNS reply.
- */
-static void
-udp_refuse (struct udp_pcb *pcb)
-{
-    udp_recv (pcb, udp_refuse_handler, NULL);
 }
 
 static void
@@ -845,7 +841,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     int type, lookup, overflow;
 
     if (!READ_ONCE (run)) {
-        udp_refuse (pcb);
+        udp_recv (pcb, udp_drop_handler, NULL);
         return;
     }
 
@@ -859,10 +855,11 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         }
     }
 
+    /* As for TCP, the session can't be destroyed here. */
     stack_size = hev_config_get_misc_task_stack_size ();
     task = hev_task_new (stack_size);
     if (!task) {
-        udp_refuse (pcb);
+        udp_recv (pcb, udp_drop_handler, NULL);
         return;
     }
 
@@ -878,14 +875,14 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     }
     if (type == SESSION_UDP && session_admit (SESSION_UDP) < 0) {
         hev_task_unref (task);
-        udp_refuse (pcb);
+        udp_recv (pcb, udp_drop_handler, NULL);
         return;
     }
 
     udp = hev_socks5_session_udp_new (pcb, &mutex);
     if (!udp) {
         hev_task_unref (task);
-        udp_refuse (pcb);
+        udp_recv (pcb, udp_drop_handler, NULL);
         return;
     }
 
@@ -1104,6 +1101,7 @@ tunnel_init (int extern_tun_fd)
     offload = hev_config_get_tunnel_offload ();
 
     if (extern_tun_fd >= 0) {
+#ifndef _WIN32
         int nonblock = 1;
 
         res = ioctl (extern_tun_fd, FIONBIO, (char *)&nonblock);
@@ -1111,6 +1109,7 @@ tunnel_init (int extern_tun_fd)
             LOG_E ("socks5 tunnel non-blocking");
             return -1;
         }
+#endif
 
         tun_fd = extern_tun_fd;
         hev_tunnel_set_offload (tun_fd, offload);
@@ -1172,8 +1171,12 @@ tunnel_fini (void)
 {
     const char *script_path;
 
-    if (!tun_fd_local)
+    if (!tun_fd_local) {
+        /* The fd belongs to the caller, only release what we hold for it. */
+        hev_tunnel_set_offload (-1, 0);
+        tun_fd = -1;
         return;
+    }
 
     script_path = hev_config_get_tunnel_pre_down_script ();
     if (script_path)
@@ -1266,18 +1269,17 @@ gateway_fini (void)
 static int
 event_task_init (void)
 {
-    int nonblock = 1;
     int res;
 
-    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, event_fds);
+    res = hev_task_io_socket_socketpair (PF_LOCAL, SOCK_STREAM, 0, event_fds);
     if (res < 0) {
         LOG_E ("socks5 tunnel event");
         return -1;
     }
 
-    res = ioctl (event_fds[0], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel event nonblock");
+    if ((hev_task_io_fcntl (event_fds[0], F_SETFD, FD_CLOEXEC) < 0) ||
+        (hev_task_io_fcntl (event_fds[1], F_SETFD, FD_CLOEXEC) < 0)) {
+        LOG_E ("socks5 tunnel event cloexec");
         return -1;
     }
 
@@ -1299,11 +1301,11 @@ event_task_fini (void)
     }
 
     if (event_fds[0] >= 0) {
-        close (event_fds[0]);
+        hev_task_io_close (event_fds[0]);
         event_fds[0] = -1;
     }
     if (event_fds[1] >= 0) {
-        close (event_fds[1]);
+        hev_task_io_close (event_fds[1]);
         event_fds[1] = -1;
     }
 }
@@ -1311,11 +1313,10 @@ event_task_fini (void)
 static int
 relief_task_init (void)
 {
-    int nonblock = 1;
     int fds[2];
     int res;
 
-    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, fds);
+    res = hev_task_io_socket_socketpair (PF_LOCAL, SOCK_STREAM, 0, fds);
     if (res < 0) {
         LOG_E ("socks5 tunnel relief");
         return -1;
@@ -1326,15 +1327,9 @@ relief_task_init (void)
     relief_fds[1] = fds[1];
     pthread_mutex_unlock (&relief_mutex);
 
-    res = ioctl (relief_fds[0], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel relief nonblock");
-        return -1;
-    }
-
-    res = ioctl (relief_fds[1], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel relief nonblock");
+    if ((hev_task_io_fcntl (relief_fds[0], F_SETFD, FD_CLOEXEC) < 0) ||
+        (hev_task_io_fcntl (relief_fds[1], F_SETFD, FD_CLOEXEC) < 0)) {
+        LOG_E ("socks5 tunnel relief cloexec");
         return -1;
     }
 
@@ -1358,11 +1353,11 @@ relief_task_fini (void)
     /* Under the lock: a concurrent relieve must not write to a closed fd. */
     pthread_mutex_lock (&relief_mutex);
     if (relief_fds[0] >= 0) {
-        close (relief_fds[0]);
+        hev_task_io_close (relief_fds[0]);
         relief_fds[0] = -1;
     }
     if (relief_fds[1] >= 0) {
-        close (relief_fds[1]);
+        hev_task_io_close (relief_fds[1]);
         relief_fds[1] = -1;
     }
     pthread_mutex_unlock (&relief_mutex);
@@ -1561,7 +1556,9 @@ hev_socks5_tunnel_init (int tun_fd)
     if (res < 0)
         goto exit;
 
+#ifdef SIGPIPE
     signal (SIGPIPE, SIG_IGN);
+#endif
 
     hev_task_mutex_init (&mutex);
 
@@ -1644,7 +1641,8 @@ retry:
     if (res & SYNC_SEND) {
         res = atomic_fetch_or (&tsync, SYNC_SENT);
         if (!(res & SYNC_SENT)) {
-            res = write (event_fds[1], &res, 1);
+            res = hev_task_io_write (event_fds[1], &res, 1, hev_task_io_nowait,
+                                     NULL);
             assert (res > 0 && "socks5 tunnel write event");
         }
     } else {
@@ -1665,7 +1663,8 @@ hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
 
     pthread_mutex_lock (&relief_mutex);
     if (relief_fds[1] >= 0)
-        res = write (relief_fds[1], &relief, sizeof (relief));
+        res = hev_task_io_write (relief_fds[1], &relief, sizeof (relief),
+                                 hev_task_io_nowait, NULL);
     pthread_mutex_unlock (&relief_mutex);
 
     if (res != sizeof (relief))
@@ -1907,7 +1906,7 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     return 0;
 }
 
-void
+EXPORT_SYMBOL void
 hev_socks5_tunnel_stats (size_t *tx_packets, size_t *tx_bytes,
                          size_t *rx_packets, size_t *rx_bytes)
 {

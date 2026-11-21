@@ -35,8 +35,8 @@ typedef struct _HevSocks5UDPFrame HevSocks5UDPFrame;
 struct _HevSocks5UDPFrame
 {
     HevListNode node;
-    HevSocks5Addr addr;
     struct pbuf *data;
+    HevSocks5Addr addr;
 };
 
 /* Caps written from any thread; the counters belong to the tunnel thread. */
@@ -83,7 +83,8 @@ udp_check_ctrl (HevSocks5 *self)
         ssize_t res;
         char buf;
 
-        res = recv (self->fd, &buf, sizeof (buf), 0);
+        res = hev_task_io_socket_recv (self->fd, &buf, sizeof (buf), 0,
+                                       hev_task_io_nowait, NULL);
         if ((res == 0) || ((res < 0) && (errno != EAGAIN))) {
             int error = errno;
             hev_socks5_log_failure (self, "udp-control",
@@ -315,7 +316,9 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     HevSocks5SessionUDP *self = arg;
     HevSocks5UDPFrame *frame;
+    HevSocks5Addr saddr;
     int total_cap;
+    int alen, res;
 
     if (!p) {
         hev_socks5_session_terminate (HEV_SOCKS5_SESSION (self));
@@ -344,7 +347,14 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         p = q;
     }
 
-    frame = hev_malloc (sizeof (HevSocks5UDPFrame));
+    res = hev_socks5_addr_from_lwip (&saddr, &pcb->local_ip, pcb->local_port);
+    if (res < 0) {
+        pbuf_free (p);
+        return;
+    }
+
+    alen = hev_socks5_addr_len (&saddr);
+    frame = hev_malloc (offsetof (HevSocks5UDPFrame, addr) + alen);
     if (!frame) {
         pbuf_free (p);
         return;
@@ -352,15 +362,15 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
     frame->data = p;
     memset (&frame->node, 0, sizeof (frame->node));
-    hev_socks5_addr_from_lwip (&frame->addr, &pcb->local_ip, pcb->local_port);
+    memcpy (&frame->addr, &saddr, alen);
 
     if (!HEV_SOCKS5 (self)->diagnostic_target[0]) {
         char target[272];
-        if (hev_socks5_addr_into_str (&frame->addr, target, sizeof (target)))
+        if (hev_socks5_addr_into_str (&saddr, target, sizeof (target)))
             hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), target);
     }
 
-    if (frame->addr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {
+    if (saddr.atype == HEV_SOCKS5_ADDR_TYPE_NAME) {
         self->addr = ip_2_ip4 (&pcb->local_ip)->addr;
         self->port = pcb->local_port;
     }
