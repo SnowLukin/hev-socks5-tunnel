@@ -51,6 +51,23 @@ addresses (`203.0.113.10`, `2001:db8::10`) exist only in the server
 namespace, so a connection can succeed only if it really went through the
 tunnel and the SOCKS5 server.
 
+## Memory limits
+
+`tests/functional/test_memory.py` runs the tunnel with a hard memory limit
+(cgroup v2 `memory.max`, no swap: the kernel kills it beyond, as iOS does with
+a Network Extension) and hits it with surges of thousands of connections from
+`hevtest/load.py`. The tests are skipped when the memory controller is not
+available to the root cgroup's children.
+
+`tests/bench/bench_surge.py` measures, under the same limit, what happens to
+long-lived flows (a call, keep-alives, an idle connection, a download) while
+new connections keep coming, for each kind of surge. It takes about fifteen
+minutes and runs only with `-k surge`; `HEVTEST_SURGE` (JSON, see the module)
+picks the configs and surges and adds keep-alives, delay and loss, a busy CPU
+or another memory limit. The tunnel is restarted for each surge, but the
+targets are shared, so a surge that fills windows can slow the next
+measurement down; run each kind on its own when comparing builds.
+
 ## Adding a platform
 
 Create `hevtest/platform/<name>.py` with a `Bed` class deriving from
