@@ -23,6 +23,16 @@ typedef void HevSocks5Session;
 typedef struct _HevSocks5SessionData HevSocks5SessionData;
 typedef struct _HevSocks5SessionIface HevSocks5SessionIface;
 
+/* HevSocks5SessionData.type */
+enum
+{
+    SESSION_UDP,
+    SESSION_TCP,
+    /* UDP to the DNS resolvers, in a pool of its own. */
+    SESSION_DNS,
+    SESSION_TYPES,
+};
+
 struct _HevSocks5SessionData
 {
     HevListNode node;
@@ -39,6 +49,8 @@ struct _HevSocks5SessionData
     int lookup;
     /* Replaces the UDP read-write timeout after the handshake if > 0. */
     int timeout;
+    /* Charged to the tunnel buffer budget, see hev-socks5-tunnel.c. */
+    int buffered;
 };
 
 struct _HevSocks5SessionIface
@@ -47,12 +59,15 @@ struct _HevSocks5SessionIface
     HevTask *(*get_task) (HevSocks5Session *self);
     void (*set_task) (HevSocks5Session *self, HevTask *task);
     HevListNode *(*get_node) (HevSocks5Session *self);
+    void (*release) (HevSocks5Session *self);
 };
 
 void *hev_socks5_session_iface (void);
 
 void hev_socks5_session_run (HevSocks5Session *self);
 void hev_socks5_session_terminate (HevSocks5Session *self);
+void hev_socks5_session_release (HevSocks5Session *self);
+void hev_socks5_session_abort (HevSocks5Session *self);
 int hev_socks5_session_idle_wait (HevSocks5Session *self, int released);
 
 void hev_socks5_session_set_task (HevSocks5Session *self, HevTask *task);

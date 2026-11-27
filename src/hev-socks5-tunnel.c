@@ -60,15 +60,6 @@ enum
     SYNC_STOP = 1 << 3,
 };
 
-enum
-{
-    SESSION_UDP,
-    SESSION_TCP,
-    /* UDP to the DNS resolvers, in a pool of its own. */
-    SESSION_DNS,
-    SESSION_TYPES,
-};
-
 #define DNS_PORT 53
 #define DNS_PRIORITY_ADDRS 4
 /* A resolver retries a query after about this long without a reply. */
@@ -99,18 +90,24 @@ static HevTask *task_lwip_io;
 static HevTask *task_lwip_timer;
 static HevTask *task_relief;
 
-/* Live sessions per type, least recently active first. */
-static HevList session_live[SESSION_TYPES];
+/*
+ * Live UDP and TCP sessions in one table, least recently active first:
+ * max-session-count and the buffer budget are shared by both types.
+ */
+static HevList session_set;
+/* Live sessions of the DNS pool, outside the table and its count. */
+static HevList session_dns;
 static int session_live_count[SESSION_TYPES];
 /* Closed sessions whose task has not exited yet. */
 static HevList session_dying;
 static int session_dying_count;
 
+/* misc.max-buffer-size, see hev_socks5_tunnel_buffer_charge. */
+size_t hev_socks5_tunnel_buffer_limit;
+static size_t buffer_used;
+static size_t window_used;
+
 /* Written from any thread, read by the tunnel thread. */
-static int session_cap[SESSION_TYPES];
-static int session_evict_idle_ms[SESSION_TYPES];
-static int session_protect_age_ms[SESSION_TYPES];
-static int session_protect_idle_ms[SESSION_TYPES];
 static int probe_hold_types = HEV_SOCKS5_TUNNEL_SESSION_UDP |
                               HEV_SOCKS5_TUNNEL_SESSION_TCP;
 static int probe_close_types = HEV_SOCKS5_TUNNEL_SESSION_UDP |
@@ -122,9 +119,10 @@ static uint64_t stat_evicted[SESSION_TYPES];
 static uint64_t stat_refused[SESSION_TYPES];
 static uint64_t stat_relieved[SESSION_TYPES];
 static uint64_t stat_refused_adm[SESSION_TYPES];
-
-/* HEV_SOCKS5_TUNNEL_ADMIT_* set from outside. */
-static int admission_ext[SESSION_TYPES];
+/* Closed while they held buffers without progress over the budget. */
+static uint64_t stat_reclaimed;
+/* Protected sessions found the last time room was made. */
+static int stat_protected;
 
 /*
  * Written from any thread, read by the tunnel thread. A flow that starts
@@ -257,28 +255,37 @@ stat_inc (uint64_t *counter)
 static int
 sessions_empty (void)
 {
-    int i;
+    return !hev_list_first (&session_set) && !hev_list_first (&session_dns) &&
+           !hev_list_first (&session_dying);
+}
 
-    for (i = 0; i < SESSION_TYPES; i++)
-        if (hev_list_first (&session_live[i]))
-            return 0;
-
-    return !hev_list_first (&session_dying);
+static HevList *
+session_list (int type)
+{
+    return (type == SESSION_DNS) ? &session_dns : &session_set;
 }
 
 /*
- * Closes the session and takes it off its live list at once, so caps and
+ * Closes the session and takes it off its live list at once, so the count and
  * eviction never count or pick it again while its task is still exiting.
+ *
+ * With release, what it holds in lwIP is dropped right away and the upstream
+ * connection is reset: in a burst each new connection brings a full window of
+ * data with it before the evicted ones get to run. The caller holds the lwIP
+ * mutex then.
  */
 static void
-session_kill (HevSocks5SessionData *sd)
+session_kill (HevSocks5SessionData *sd, int release)
 {
     if (sd->dying)
         return;
 
-    hev_socks5_session_terminate (sd->self);
+    if (release)
+        hev_socks5_session_release (sd->self);
+    else
+        hev_socks5_session_terminate (sd->self);
 
-    hev_list_del (&session_live[sd->type], &sd->node);
+    hev_list_del (session_list (sd->type), &sd->node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] - 1, __ATOMIC_RELAXED);
     if (sd->type != SESSION_DNS)
@@ -290,56 +297,109 @@ session_kill (HevSocks5SessionData *sd)
                       __ATOMIC_RELAXED);
 }
 
-static HevSocks5SessionData *
-session_lru (int type)
+/*
+ * A session is kept when room is made if upstream replied, it still talked
+ * half of evict-protect-idle after it was created, and it has been silent for
+ * less than evict-protect-idle: a flow with rare keep-alives outlives a surge
+ * of new ones, a one-shot exchange like a DNS query doesn't. A lookup that
+ * did not fit in the DNS pool is a one-shot flow even after its reply.
+ */
+static int
+session_is_protected (HevSocks5SessionData *sd, int idle, int64_t now)
 {
-    HevListNode *node = hev_list_first (&session_live[type]);
+    if (!idle || !sd->answered || sd->lookup)
+        return 0;
 
-    if (!node)
-        return NULL;
-
-    return container_of (node, HevSocks5SessionData, node);
+    return ((sd->active_time - sd->create_time) >= (idle / 2)) &&
+           ((now - sd->active_time) < idle);
 }
 
 /*
- * A new session of this type may take the place of the least recently
- * active one only if that one has been silent long enough: a call or a
- * download never goes silent, a one-shot flow does. An established
- * conversation (got a reply and lived protect_age) keeps its place until it
- * is silent protect_idle, so a keep-alive every few seconds survives a storm
- * of one-shot flows. A lookup that did not fit in the DNS pool is a one-shot
- * flow even after its reply.
+ * A session upstream answered less than SESSION_EVICT_YOUNG_TIME after it was
+ * created, like a TLS handshake after the server hello.
  */
 static int
-session_evict_idle (int type, int64_t now)
+session_is_young (HevSocks5SessionData *sd, int idle, int64_t now)
 {
-    int idle_ms, protect_age, protect_idle;
+    if (!idle || !sd->answered || sd->lookup)
+        return 0;
+
+    return (now - sd->create_time) < SESSION_EVICT_YOUNG_TIME;
+}
+
+/*
+ * Evicts sessions of the type (SESSION_TYPES: either) from the table until
+ * count of them is under limit, the least recently active first. Protected
+ * sessions are kept up to half of limit, young ones in what is left of that
+ * half, past that they go in the same order as the others. Returns the number
+ * evicted. The caller holds the lwIP mutex.
+ */
+static int
+session_make_room (int type, int count, int limit, int64_t now)
+{
+    int idle = hev_config_get_misc_evict_protect_idle ();
+    int protected_over = 0;
+    int young_over = 0;
+    int evicted = 0;
     HevListNode *node;
 
-    idle_ms = __atomic_load_n (&session_evict_idle_ms[type], __ATOMIC_RELAXED);
-    protect_age =
-        __atomic_load_n (&session_protect_age_ms[type], __ATOMIC_RELAXED);
-    protect_idle =
-        __atomic_load_n (&session_protect_idle_ms[type], __ATOMIC_RELAXED);
+    if (count < limit)
+        return 0;
 
-    node = hev_list_first (&session_live[type]);
-    for (; node; node = hev_list_node_next (node)) {
+    if (idle) {
+        int protected_count = 0;
+        int young_count = 0;
+        int half = limit / 2;
+
+        node = hev_list_first (&session_set);
+        for (; node; node = hev_list_node_next (node)) {
+            HevSocks5SessionData *sd;
+
+            sd = container_of (node, HevSocks5SessionData, node);
+            if (type != SESSION_TYPES && sd->type != type)
+                continue;
+            if (session_is_protected (sd, idle, now))
+                protected_count++;
+            else if (session_is_young (sd, idle, now))
+                young_count++;
+        }
+
+        protected_over = protected_count - half;
+        if (protected_over < 0) {
+            young_over = young_count + protected_count - half;
+            protected_over = 0;
+        } else {
+            young_over = young_count;
+        }
+        __atomic_store_n (&stat_protected, protected_count, __ATOMIC_RELAXED);
+    }
+
+    node = hev_list_first (&session_set);
+    while (node && (count >= limit)) {
+        HevListNode *next = hev_list_node_next (node);
         HevSocks5SessionData *sd;
 
         sd = container_of (node, HevSocks5SessionData, node);
-        if (now - sd->active_time < idle_ms)
-            break;
-        if (protect_age > 0 && sd->answered && !sd->lookup &&
-            now - sd->create_time >= protect_age &&
-            now - sd->active_time < protect_idle)
+        node = next;
+        if (type != SESSION_TYPES && sd->type != type)
             continue;
+        if (session_is_protected (sd, idle, now)) {
+            if (protected_over <= 0)
+                continue;
+            protected_over--;
+        } else if (session_is_young (sd, idle, now)) {
+            if (young_over <= 0)
+                continue;
+            young_over--;
+        }
 
-        session_kill (sd);
-        stat_inc (&stat_evicted[type]);
-        return 0;
+        stat_inc (&stat_evicted[sd->type]);
+        session_kill (sd, 1);
+        count--;
+        evicted++;
     }
 
-    return -1;
+    return evicted;
 }
 
 static int
@@ -438,12 +498,10 @@ probe_update (int64_t now)
     return state;
 }
 
-/* The probe state as it applies to one type, combined with the caller's. */
+/* The probe state as it applies to one type. */
 static int
 admission_for (int type, int probe)
 {
-    int ext;
-
     if (probe == HEV_SOCKS5_TUNNEL_ADMIT_CLOSED &&
         !(__atomic_load_n (&probe_close_types, __ATOMIC_RELAXED) & (1 << type)))
         probe = HEV_SOCKS5_TUNNEL_ADMIT_HOLD;
@@ -451,42 +509,42 @@ admission_for (int type, int probe)
         !(__atomic_load_n (&probe_hold_types, __ATOMIC_RELAXED) & (1 << type)))
         probe = HEV_SOCKS5_TUNNEL_ADMIT_OPEN;
 
-    ext = __atomic_load_n (&admission_ext[type], __ATOMIC_RELAXED);
-    return ext > probe ? ext : probe;
+    return probe;
 }
 
+/*
+ * Makes room for a new session before it is created, so that it can't evict
+ * itself and max-session-count sessions can be open at once. A new session is
+ * refused only while the memory probe is CLOSED for its type. In HOLD the
+ * sessions of its type don't grow: it takes the place of one of them, chosen
+ * as at max-session-count, so that a UDP surge does not close TCP connections.
+ * The caller holds the lwIP mutex.
+ */
 static int
 session_admit (int type)
 {
     int64_t now = monotonic_ms ();
-    int state, cap;
+    int state, max;
 
     admit_replaced = 0;
     state = admission_for (type, probe_update (now));
 
     if (state >= HEV_SOCKS5_TUNNEL_ADMIT_CLOSED) {
         stat_inc (&stat_refused_adm[type]);
-        goto refuse;
+        stat_inc (&stat_refused[type]);
+        return -1;
     }
 
-    cap = __atomic_load_n (&session_cap[type], __ATOMIC_RELAXED);
-    if (state == HEV_SOCKS5_TUNNEL_ADMIT_OPEN &&
-        (cap <= 0 || session_live_count[type] < cap))
-        return 0;
-
-    /* At the cap, and in HOLD at any count: only in place of a silent one. */
-    if (session_evict_idle (type, now) == 0) {
+    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD && session_live_count[type] &&
+        session_make_room (type, session_live_count[type],
+                           session_live_count[type], now))
         admit_replaced = 1;
-        return 0;
-    }
 
-    /* At the cap the refusal is the cap's, even in HOLD. */
-    if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD &&
-        (cap <= 0 || session_live_count[type] < cap))
-        stat_inc (&stat_refused_adm[type]);
-refuse:
-    stat_inc (&stat_refused[type]);
-    return -1;
+    max = hev_config_get_misc_max_session_count ();
+    if (max > 0 && session_make_room (SESSION_TYPES, session_count, max, now))
+        admit_replaced = 1;
+
+    return 0;
 }
 
 /*
@@ -528,7 +586,7 @@ session_admit_dns (void)
     if (session_live_count[SESSION_DNS] < cap)
         return 0;
 
-    node = hev_list_first (&session_live[SESSION_DNS]);
+    node = hev_list_first (&session_dns);
     for (; node; node = hev_list_node_next (node)) {
         HevSocks5SessionData *sd;
 
@@ -536,7 +594,7 @@ session_admit_dns (void)
         if (dns_session_waiting (sd, now))
             continue;
 
-        session_kill (sd);
+        session_kill (sd, 1);
         stat_inc (&stat_evicted[SESSION_DNS]);
         admit_replaced = 1;
         return 0;
@@ -617,28 +675,6 @@ dns_priority_store (int cap, int timeout_ms, const uint32_t *addrs, int n)
     __atomic_store_n (&dns_priority_cap, cap, __ATOMIC_RELEASE);
 }
 
-/* Upstream max-session-count: rotate out the least recently active. */
-static void
-session_rotate (void)
-{
-    HevSocks5SessionData *udp, *tcp, *sd;
-    int max_session_count;
-
-    max_session_count = hev_config_get_misc_max_session_count ();
-    if (!max_session_count || session_count < max_session_count)
-        return;
-
-    udp = session_lru (SESSION_UDP);
-    tcp = session_lru (SESSION_TCP);
-    if (udp && tcp)
-        sd = (udp->active_time <= tcp->active_time) ? udp : tcp;
-    else
-        sd = udp ? udp : tcp;
-
-    if (sd)
-        session_kill (sd);
-}
-
 static void
 hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
 {
@@ -652,14 +688,15 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
     sd->pending = 0;
     sd->lookup = lookup;
     sd->timeout = 0;
+    sd->buffered = 0;
     if (lookup)
         sd->timeout =
             __atomic_load_n (&dns_priority_timeout_ms, __ATOMIC_RELAXED);
 
-    hev_list_add_tail (&session_live[sd->type], node);
+    hev_list_add_tail (session_list (sd->type), node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] + 1, __ATOMIC_RELAXED);
-    /* max-session-count rotates only UDP and TCP, so the pool is not counted. */
+    /* The pool is outside the table, max-session-count does not count it. */
     if (sd->type != SESSION_DNS)
         session_count++;
     stat_inc (&stat_created[sd->type]);
@@ -670,8 +707,6 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
     if (!admit_replaced)
         young_ring[young_head++ % YOUNG_RING] = sd->create_time;
     admit_replaced = 0;
-
-    session_rotate ();
 }
 
 static void
@@ -687,7 +722,7 @@ hev_socks5_tunnel_delete_session (HevListNode *node)
         return;
     }
 
-    hev_list_del (&session_live[sd->type], node);
+    hev_list_del (session_list (sd->type), node);
     __atomic_store_n (&session_live_count[sd->type],
                       session_live_count[sd->type] - 1, __ATOMIC_RELAXED);
     if (sd->type != SESSION_DNS)
@@ -705,8 +740,107 @@ hev_socks5_tunnel_update_session (HevListNode *node)
     if (sd->dying)
         return;
 
-    hev_list_del (&session_live[sd->type], node);
-    hev_list_add_tail (&session_live[sd->type], node);
+    hev_list_del (session_list (sd->type), node);
+    hev_list_add_tail (session_list (sd->type), node);
+}
+
+/*
+ * Buffer budget (misc.max-buffer-size), 0 means unlimited: then nothing is
+ * charged, the sessions check hev_socks5_tunnel_buffer_limit first.
+ *
+ * The packets the sessions hold in lwIP are charged to buffer_used: the TCP
+ * receive queues and the UDP datagram queues. Their size is bounded by:
+ *
+ *  - TCP: the receive window of each session, granted out of 3/4 of the
+ *    budget, at least a fair share of it, and never less than what lwIP needs
+ *    to announce a closed window again. A session that holds more than it is
+ *    granted does not get its window reopened as far, until it is under.
+ *  - UDP: datagrams are dropped while the budget is used up, except for the
+ *    DNS pool, whose small queues are charged but never dropped for it.
+ *
+ * Only the window floors can overcommit it, by up to a floor for each session
+ * that is receiving at once. Then the sessions that hold packets without any
+ * progress for BUFFER_RECLAIM_IDLE_TIME are evicted, the least recently
+ * active first, the ones that make progress keep going with smaller windows.
+ */
+void
+hev_socks5_tunnel_buffer_charge (HevSocks5SessionData *sd, int size)
+{
+    if (size < 0 && -size > sd->buffered)
+        size = -sd->buffered;
+
+    sd->buffered += size;
+    /* Read by the stats from any thread. */
+    __atomic_store_n (&buffer_used, buffer_used + size, __ATOMIC_RELAXED);
+}
+
+int
+hev_socks5_tunnel_buffer_admit (int size)
+{
+    return (buffer_used + size) <= hev_socks5_tunnel_buffer_limit;
+}
+
+unsigned int
+hev_socks5_tunnel_window_target (unsigned int window, unsigned int floor,
+                                 unsigned int max)
+{
+    size_t limit, others, room, fair;
+
+    limit = hev_socks5_tunnel_buffer_limit / 4 * 3;
+    others = window_used - window;
+    room = (limit > others) ? limit - others : 0;
+
+    /* Sessions over their fair share give it back as they go. */
+    fair = limit / (session_count + 1);
+    if (room < fair)
+        room = fair;
+
+    if (room < floor)
+        return floor;
+    if (room > max)
+        return max;
+    return room;
+}
+
+void
+hev_socks5_tunnel_window_set (unsigned int *window, unsigned int size)
+{
+    window_used += size;
+    window_used -= *window;
+    *window = size;
+}
+
+/* The caller holds the lwIP mutex. */
+static void
+hev_socks5_tunnel_reclaim (void)
+{
+    size_t limit = hev_socks5_tunnel_buffer_limit;
+    HevListNode *node;
+    int64_t now;
+    size_t used;
+
+    if (!limit || buffer_used <= limit)
+        return;
+
+    now = monotonic_ms ();
+    used = buffer_used;
+    node = hev_list_first (&session_set);
+    while (node && used > limit / 4 * 3) {
+        HevListNode *next = hev_list_node_next (node);
+        HevSocks5SessionData *sd;
+
+        sd = container_of (node, HevSocks5SessionData, node);
+        /* In LRU order, the rest made progress more recently. */
+        if ((now - sd->active_time) < BUFFER_RECLAIM_IDLE_TIME)
+            break;
+        if (sd->buffered > 0) {
+            LOG_I ("%p socks5 tunnel buffer full, evict", sd->self);
+            used -= sd->buffered;
+            stat_inc (&stat_reclaimed);
+            session_kill (sd, 1);
+        }
+        node = next;
+    }
 }
 
 static void
@@ -767,15 +901,16 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
         return ERR_RST;
     }
 
+    /* Before the session sizes its receive window, it depends on the mss. */
+    if (hev_tunnel_get_offload () &
+        (HEV_TUNNEL_OFFLOAD_TCP | HEV_TUNNEL_OFFLOAD_JUMBO))
+        tcp_pcb_set_gso (pcb);
+
     tcp = hev_socks5_session_tcp_new (pcb, &mutex);
     if (!tcp) {
         hev_task_unref (task);
         return ERR_MEM;
     }
-
-    if (hev_tunnel_get_offload () &
-        (HEV_TUNNEL_OFFLOAD_TCP | HEV_TUNNEL_OFFLOAD_JUMBO))
-        tcp_pcb_set_gso (pcb);
 
     hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
     node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
@@ -901,34 +1036,32 @@ relieve_sessions (const HevSocks5TunnelRelief *relief)
     int64_t now = monotonic_ms ();
     int closed[SESSION_TYPES] = { 0 };
     int total = session_count;
+    HevListNode *node;
 
-    /* Lists are least recently active first: max_count picks the quietest. */
-    for (;;) {
-        HevSocks5SessionData *sd = NULL;
-        int i;
+    hev_task_mutex_lock (&mutex);
+
+    /* The table is least recently active first: max_count picks the quietest. */
+    node = hev_list_first (&session_set);
+    while (node) {
+        HevListNode *next = hev_list_node_next (node);
+        HevSocks5SessionData *sd;
 
         if (relief->max_count &&
             (closed[SESSION_UDP] + closed[SESSION_TCP]) >= relief->max_count)
             break;
 
-        for (i = 0; i < SESSION_TYPES; i++) {
-            HevSocks5SessionData *c;
-
-            if (!(relief->types & (1 << i)))
-                continue;
-            c = session_lru (i);
-            if (!c || now - c->active_time < relief->idle_ms)
-                continue;
-            if (!sd || c->active_time < sd->active_time)
-                sd = c;
-        }
-        if (!sd)
+        sd = container_of (node, HevSocks5SessionData, node);
+        if (now - sd->active_time < relief->idle_ms)
             break;
-
-        closed[sd->type]++;
-        stat_inc (&stat_relieved[sd->type]);
-        session_kill (sd);
+        if (relief->types & (1 << sd->type)) {
+            closed[sd->type]++;
+            stat_inc (&stat_relieved[sd->type]);
+            session_kill (sd, 1);
+        }
+        node = next;
     }
+
+    hev_task_mutex_unlock (&mutex);
 
     LOG_W ("socks5 tunnel relieve types %d idle %d max %d: udp %d tcp %d of %d",
            relief->types, relief->idle_ms, relief->max_count,
@@ -971,11 +1104,12 @@ event_task_entry (void *data)
     WRITE_ONCE (run, 0);
     atomic_fetch_and (&tsync, ~SYNC_SENT);
     hev_task_wakeup (task_relief);
-    for (i = 0; i < SESSION_TYPES; i++) {
-        HevSocks5SessionData *sd;
+    for (i = 0; i < 2; i++) {
+        HevList *list = i ? &session_dns : &session_set;
+        HevListNode *node;
 
-        while ((sd = session_lru (i)))
-            session_kill (sd);
+        while ((node = hev_list_first (list)))
+            session_kill (container_of (node, HevSocks5SessionData, node), 0);
     }
 
     hev_task_join (task_lwip_io);
@@ -1063,6 +1197,7 @@ lwip_timer_task_entry (void *data)
     for (i = 1; READ_ONCE (run); i++) {
         hev_task_mutex_lock (&mutex);
         tcp_tmr ();
+        hev_socks5_tunnel_reclaim ();
 
         if ((i & 3) == 0) {
 #if IP_REASSEMBLY
@@ -1449,34 +1584,12 @@ session_limits_init (void)
     uint32_t addrs[DNS_PRIORITY_ADDRS];
     int i, n, cap;
 
-    __atomic_store_n (&session_cap[SESSION_UDP],
-                      hev_config_get_misc_udp_max_sessions (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_cap[SESSION_TCP],
-                      hev_config_get_misc_tcp_max_sessions (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_evict_idle_ms[SESSION_UDP],
-                      hev_config_get_misc_udp_evict_min_idle (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_evict_idle_ms[SESSION_TCP],
-                      hev_config_get_misc_tcp_evict_min_idle (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_protect_age_ms[SESSION_UDP],
-                      hev_config_get_misc_udp_evict_protect_age (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_protect_idle_ms[SESSION_UDP],
-                      hev_config_get_misc_udp_evict_protect_idle (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_protect_age_ms[SESSION_TCP],
-                      hev_config_get_misc_tcp_evict_protect_age (),
-                      __ATOMIC_RELAXED);
-    __atomic_store_n (&session_protect_idle_ms[SESSION_TCP],
-                      hev_config_get_misc_tcp_evict_protect_idle (),
-                      __ATOMIC_RELAXED);
+    hev_socks5_tunnel_buffer_limit = hev_config_get_misc_max_buffer_size ();
+    buffer_used = 0;
+    window_used = 0;
+    __atomic_store_n (&stat_reclaimed, 0, __ATOMIC_RELAXED);
+    __atomic_store_n (&stat_protected, 0, __ATOMIC_RELAXED);
 
-    hev_socks5_session_udp_set_queue_cap (
-        hev_config_get_misc_udp_queue_frames (),
-        hev_config_get_misc_udp_queue_total_frames ());
     hev_socks5_session_udp_reset_queue_stats ();
 
     __atomic_store_n (&probe_state, HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
@@ -1507,8 +1620,6 @@ session_limits_init (void)
                         n);
 
     for (i = 0; i < SESSION_TYPES; i++) {
-        __atomic_store_n (&admission_ext[i], HEV_SOCKS5_TUNNEL_ADMIT_OPEN,
-                          __ATOMIC_RELAXED);
         __atomic_store_n (&stat_refused_adm[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_created[i], 0, __ATOMIC_RELAXED);
         __atomic_store_n (&stat_evicted[i], 0, __ATOMIC_RELAXED);
@@ -1673,99 +1784,6 @@ hev_socks5_tunnel_relieve (int types, int idle_ms, int max_count)
     return 0;
 }
 
-static int
-session_index (int type)
-{
-    switch (type) {
-    case HEV_SOCKS5_TUNNEL_SESSION_UDP:
-        return SESSION_UDP;
-    case HEV_SOCKS5_TUNNEL_SESSION_TCP:
-        return SESSION_TCP;
-    }
-
-    return -1;
-}
-
-int
-hev_socks5_tunnel_set_session_cap (int type, int max_live,
-                                   int evict_min_idle_ms)
-{
-    int i = session_index (type);
-
-    if (i < 0)
-        return -1;
-
-    if (max_live < 0)
-        max_live = (i == SESSION_UDP) ?
-                       hev_config_get_misc_udp_max_sessions () :
-                       hev_config_get_misc_tcp_max_sessions ();
-    if (evict_min_idle_ms < 0)
-        evict_min_idle_ms = (i == SESSION_UDP) ?
-                                hev_config_get_misc_udp_evict_min_idle () :
-                                hev_config_get_misc_tcp_evict_min_idle ();
-
-    __atomic_store_n (&session_cap[i], max_live, __ATOMIC_RELAXED);
-    __atomic_store_n (&session_evict_idle_ms[i], evict_min_idle_ms,
-                      __ATOMIC_RELAXED);
-
-    return 0;
-}
-
-int
-hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames, int total_frames)
-{
-    if (per_session_frames > UDP_POOL_SIZE + 1)
-        return -1;
-
-    if (per_session_frames <= 0)
-        per_session_frames = hev_config_get_misc_udp_queue_frames ();
-    if (total_frames < 0)
-        total_frames = hev_config_get_misc_udp_queue_total_frames ();
-
-    hev_socks5_session_udp_set_queue_cap (per_session_frames, total_frames);
-
-    return 0;
-}
-
-int
-hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms, int min_idle_ms)
-{
-    int i = session_index (type);
-
-    if (i < 0 || min_age_ms < 0 || min_idle_ms < 0)
-        return -1;
-
-    __atomic_store_n (&session_protect_age_ms[i], min_age_ms, __ATOMIC_RELAXED);
-    __atomic_store_n (&session_protect_idle_ms[i], min_idle_ms,
-                      __ATOMIC_RELAXED);
-
-    return 0;
-}
-
-int
-hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
-                                    const char *addresses)
-{
-    uint32_t addrs[DNS_PRIORITY_ADDRS];
-    int n;
-
-    if (max_sessions < 0)
-        max_sessions = hev_config_get_misc_dns_priority_sessions ();
-    if (timeout_ms <= 0)
-        timeout_ms = hev_config_get_misc_dns_priority_timeout ();
-    if (!addresses)
-        addresses = hev_config_get_misc_dns_priority_addresses ();
-
-    n = dns_priority_parse (addresses, addrs);
-    if ((max_sessions && n < 0) ||
-        !dns_priority_valid (max_sessions, timeout_ms))
-        return -1;
-
-    dns_priority_store (max_sessions, timeout_ms, addrs, n < 0 ? 0 : n);
-
-    return 0;
-}
-
 int
 hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types)
 {
@@ -1776,25 +1794,6 @@ hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types)
 
     __atomic_store_n (&probe_hold_types, hold_types, __ATOMIC_RELAXED);
     __atomic_store_n (&probe_close_types, close_types, __ATOMIC_RELAXED);
-
-    return 0;
-}
-
-int
-hev_socks5_tunnel_set_admission (int types, int state)
-{
-    int i;
-
-    if (state < HEV_SOCKS5_TUNNEL_ADMIT_OPEN ||
-        state > HEV_SOCKS5_TUNNEL_ADMIT_CLOSED)
-        return -1;
-    if (types &
-        ~(HEV_SOCKS5_TUNNEL_SESSION_UDP | HEV_SOCKS5_TUNNEL_SESSION_TCP))
-        return -1;
-
-    for (i = 0; i < SESSION_TYPES; i++)
-        if (types & (1 << i))
-            __atomic_store_n (&admission_ext[i], state, __ATOMIC_RELAXED);
 
     return 0;
 }
@@ -1862,8 +1861,6 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
         __atomic_load_n (&stat_relieved[SESSION_UDP], __ATOMIC_RELAXED);
     s.tcp_relieved =
         __atomic_load_n (&stat_relieved[SESSION_TCP], __ATOMIC_RELAXED);
-    s.udp_cap = __atomic_load_n (&session_cap[SESSION_UDP], __ATOMIC_RELAXED);
-    s.tcp_cap = __atomic_load_n (&session_cap[SESSION_TCP], __ATOMIC_RELAXED);
     s.last_probe_kb = __atomic_load_n (&probe_last_kb, __ATOMIC_RELAXED);
     s.udp_queued_frames = hev_socks5_session_udp_get_queued_frames ();
     s.udp_queue_dropped = hev_socks5_session_udp_get_queue_dropped ();
@@ -1898,6 +1895,11 @@ hev_socks5_tunnel_get_session_stats (HevSocks5TunnelSessionStats *stats)
     s.dns_refused =
         __atomic_load_n (&stat_refused[SESSION_DNS], __ATOMIC_RELAXED);
     s.dns_overflow = __atomic_load_n (&stat_dns_overflow, __ATOMIC_RELAXED);
+    s.max_session_count = hev_config_get_misc_max_session_count ();
+    s.buffer_limit = hev_socks5_tunnel_buffer_limit;
+    s.buffer_used = __atomic_load_n (&buffer_used, __ATOMIC_RELAXED);
+    s.buffer_reclaimed = __atomic_load_n (&stat_reclaimed, __ATOMIC_RELAXED);
+    s.protected_live = __atomic_load_n (&stat_protected, __ATOMIC_RELAXED);
 
     /* A caller built against an older, shorter struct gets the fields it knows. */
     s.size = stats->size < sizeof (s) ? stats->size : sizeof (s);

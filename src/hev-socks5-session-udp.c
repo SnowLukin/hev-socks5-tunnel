@@ -39,9 +39,7 @@ struct _HevSocks5UDPFrame
     HevSocks5Addr addr;
 };
 
-/* Caps written from any thread; the counters belong to the tunnel thread. */
-static int queue_frames_cap = UDP_POOL_SIZE + 1;
-static int queue_total_cap;
+/* Counters of the tunnel thread, read by the stats from any thread. */
 static int queued_total;
 static uint64_t queue_dropped;
 
@@ -49,13 +47,6 @@ static void
 queued_total_add (int n)
 {
     __atomic_store_n (&queued_total, queued_total + n, __ATOMIC_RELAXED);
-}
-
-void
-hev_socks5_session_udp_set_queue_cap (int per_session_frames, int total_frames)
-{
-    __atomic_store_n (&queue_frames_cap, per_session_frames, __ATOMIC_RELAXED);
-    __atomic_store_n (&queue_total_cap, total_frames, __ATOMIC_RELAXED);
 }
 
 int
@@ -74,6 +65,23 @@ void
 hev_socks5_session_udp_reset_queue_stats (void)
 {
     __atomic_store_n (&queue_dropped, 0, __ATOMIC_RELAXED);
+}
+
+/*
+ * A session of the DNS pool is outside the buffer budget: a lookup must not
+ * be dropped because TCP windows have used it up. A query takes a datagram
+ * or two, its small queue and the pool size bound what the pool holds.
+ */
+static int
+udp_pool_session (HevSocks5SessionUDP *self)
+{
+    return self->data.type == SESSION_DNS;
+}
+
+static int
+udp_queue_cap (HevSocks5SessionUDP *self)
+{
+    return udp_pool_session (self) ? DNS_POOL_QUEUE_FRAMES : UDP_POOL_SIZE + 1;
 }
 
 static int
@@ -109,10 +117,30 @@ task_io_yielder (HevTaskYieldType type, void *data)
         return -1;
 
     res = hev_socks5_task_io_yielder (type, data);
-    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (self));
-    hev_socks5_tunnel_update_session (node);
+
+    /* Only data moved counts as activity, not being woken up. */
+    if (type == HEV_TASK_YIELD) {
+        node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (self));
+        hev_socks5_tunnel_update_session (node);
+    }
 
     return res;
+}
+
+static int
+udp_frame_charge (struct pbuf *p)
+{
+    return sizeof (HevSocks5UDPFrame) + p->tot_len + PBUF_CHARGE_OVERHEAD;
+}
+
+static void
+udp_frame_free (HevSocks5SessionUDP *self, HevSocks5UDPFrame *frame)
+{
+    if (hev_socks5_tunnel_buffer_limit)
+        hev_socks5_tunnel_buffer_charge (&self->data,
+                                         -udp_frame_charge (frame->data));
+    pbuf_free (frame->data);
+    hev_free (frame);
 }
 
 static int
@@ -151,11 +179,9 @@ hev_socks5_session_udp_fwd_f (HevSocks5SessionUDP *self)
         for (i = 0; i < res; i++) {
             node = hev_list_first (&self->frame_list);
             frame = container_of (node, HevSocks5UDPFrame, node);
-            buf = frame->data;
 
             hev_list_del (&self->frame_list, node);
-            hev_free (frame);
-            pbuf_free (buf);
+            udp_frame_free (self, frame);
             self->frames--;
         }
         queued_total_add (-res);
@@ -317,7 +343,6 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     HevSocks5SessionUDP *self = arg;
     HevSocks5UDPFrame *frame;
     HevSocks5Addr saddr;
-    int total_cap;
     int alen, res;
 
     if (!p) {
@@ -325,14 +350,9 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
         return;
     }
 
-    /*
-     * Every queued datagram holds its buffer until it is sent, so the queues
-     * are capped in frames: while the upstream is slow, a session drops what
-     * does not fit instead of growing outside the Go memory limit.
-     */
-    total_cap = __atomic_load_n (&queue_total_cap, __ATOMIC_RELAXED);
-    if (self->frames >= __atomic_load_n (&queue_frames_cap, __ATOMIC_RELAXED) ||
-        (total_cap > 0 && queued_total >= total_cap)) {
+    if ((self->frames >= udp_queue_cap (self)) ||
+        (hev_socks5_tunnel_buffer_limit && !udp_pool_session (self) &&
+         !hev_socks5_tunnel_buffer_admit (udp_frame_charge (p)))) {
         __atomic_fetch_add (&queue_dropped, 1, __ATOMIC_RELAXED);
         pbuf_free (p);
         return;
@@ -379,6 +399,8 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     self->data.pending++;
     queued_total_add (1);
     hev_list_add_tail (&self->frame_list, &frame->node);
+    if (hev_socks5_tunnel_buffer_limit)
+        hev_socks5_tunnel_buffer_charge (&self->data, udp_frame_charge (p));
     hev_task_wakeup (self->data.task);
 }
 
@@ -590,8 +612,7 @@ hev_socks5_session_udp_destruct (HevObject *base)
 
         frame = container_of (node, HevSocks5UDPFrame, node);
         node = hev_list_node_next (node);
-        pbuf_free (frame->data);
-        hev_free (frame);
+        udp_frame_free (self, frame);
     }
     queued_total_add (-self->frames);
     self->frames = 0;

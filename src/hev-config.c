@@ -46,9 +46,12 @@ static int mapdns_cache_size;
 static char log_file[1024];
 static char pid_file[1024];
 static int max_session_count;
+static size_t max_buffer_size;
+static int evict_protect_idle;
 static int task_stack_size;
 static int wintun_ring_capacity;
 static int tcp_buffer_size;
+static int tcp_socket_buffer_size;
 static int udp_recv_buffer_size;
 static int udp_copy_buffer_nums;
 static int connect_timeout;
@@ -58,16 +61,6 @@ static int limit_nofile;
 static int dns_priority_sessions;
 static int dns_priority_timeout;
 static char dns_priority_addresses[256];
-static int udp_max_sessions;
-static int tcp_max_sessions;
-static int udp_evict_min_idle;
-static int tcp_evict_min_idle;
-static int udp_queue_frames;
-static int udp_queue_total_frames;
-static int udp_protect_age;
-static int udp_protect_idle;
-static int tcp_protect_age;
-static int tcp_protect_idle;
 static int log_level;
 
 static int
@@ -446,12 +439,18 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
             wintun_ring_capacity = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "tcp-buffer-size"))
             tcp_buffer_size = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "tcp-socket-buffer-size"))
+            tcp_socket_buffer_size = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "udp-recv-buffer-size"))
             udp_recv_buffer_size = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "udp-copy-buffer-nums"))
             udp_copy_buffer_nums = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "max-session-count"))
             max_session_count = strtoul (value, NULL, 10);
+        else if (0 == strcmp (key, "max-buffer-size"))
+            max_buffer_size = strtoull (value, NULL, 10);
+        else if (0 == strcmp (key, "evict-protect-idle"))
+            evict_protect_idle = hev_config_parse_misc_count (key, value, 0);
         else if (0 == strcmp (key, "connect-timeout"))
             connect_timeout = strtoul (value, NULL, 10);
         else if (0 == strcmp (key, "read-write-timeout"))
@@ -476,33 +475,7 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
         else if (0 == strcmp (key, "dns-priority-addresses"))
             strncpy (dns_priority_addresses, value,
                      sizeof (dns_priority_addresses) - 1);
-        else if (0 == strcmp (key, "udp-max-sessions"))
-            udp_max_sessions = hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "tcp-max-sessions"))
-            tcp_max_sessions = hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "udp-evict-min-idle"))
-            udp_evict_min_idle = hev_config_parse_misc_count (key, value, 2000);
-        else if (0 == strcmp (key, "tcp-evict-min-idle"))
-            tcp_evict_min_idle =
-                hev_config_parse_misc_count (key, value, 60000);
-        else if (0 == strcmp (key, "udp-queue-frames"))
-            udp_queue_frames =
-                hev_config_parse_misc_count (key, value, UDP_POOL_SIZE + 1);
-        else if (0 == strcmp (key, "udp-queue-total-frames"))
-            udp_queue_total_frames =
-                hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "udp-evict-protect-age"))
-            udp_protect_age = hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "udp-evict-protect-idle"))
-            udp_protect_idle = hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "tcp-evict-protect-age"))
-            tcp_protect_age = hev_config_parse_misc_count (key, value, 0);
-        else if (0 == strcmp (key, "tcp-evict-protect-idle"))
-            tcp_protect_idle = hev_config_parse_misc_count (key, value, 0);
     }
-
-    if (udp_queue_frames <= 0 || udp_queue_frames > UDP_POOL_SIZE + 1)
-        udp_queue_frames = UDP_POOL_SIZE + 1;
 
     if (tcp_rw_timeout <= 0)
         tcp_rw_timeout = rw_timeout;
@@ -614,25 +587,18 @@ hev_config_reset (void)
     mapdns_cache_size = 0;
 
     max_session_count = 0;
+    max_buffer_size = 0;
+    evict_protect_idle = 0;
     task_stack_size = 86016;
     wintun_ring_capacity = 0x80000;
     tcp_buffer_size = 65536;
+    tcp_socket_buffer_size = 0;
     udp_recv_buffer_size = 524288;
     udp_copy_buffer_nums = 10;
     connect_timeout = 10000;
     tcp_read_write_timeout = 300000;
     udp_read_write_timeout = 60000;
     limit_nofile = 65535;
-    udp_max_sessions = 0;
-    tcp_max_sessions = 0;
-    udp_evict_min_idle = 2000;
-    tcp_evict_min_idle = 60000;
-    udp_queue_frames = UDP_POOL_SIZE + 1;
-    udp_queue_total_frames = 0;
-    udp_protect_age = 0;
-    udp_protect_idle = 0;
-    tcp_protect_age = 0;
-    tcp_protect_idle = 0;
     dns_priority_sessions = 0;
     dns_priority_timeout = 5000;
     dns_priority_addresses[0] = '\0';
@@ -836,6 +802,12 @@ hev_config_get_misc_tcp_buffer_size (void)
 }
 
 int
+hev_config_get_misc_tcp_socket_buffer_size (void)
+{
+    return tcp_socket_buffer_size;
+}
+
+int
 hev_config_get_misc_udp_recv_buffer_size (void)
 {
     return udp_recv_buffer_size;
@@ -851,6 +823,18 @@ int
 hev_config_get_misc_max_session_count (void)
 {
     return max_session_count;
+}
+
+size_t
+hev_config_get_misc_max_buffer_size (void)
+{
+    return max_buffer_size;
+}
+
+int
+hev_config_get_misc_evict_protect_idle (void)
+{
+    return evict_protect_idle;
 }
 
 int
@@ -893,66 +877,6 @@ const char *
 hev_config_get_misc_dns_priority_addresses (void)
 {
     return dns_priority_addresses;
-}
-
-int
-hev_config_get_misc_udp_max_sessions (void)
-{
-    return udp_max_sessions;
-}
-
-int
-hev_config_get_misc_tcp_max_sessions (void)
-{
-    return tcp_max_sessions;
-}
-
-int
-hev_config_get_misc_udp_evict_min_idle (void)
-{
-    return udp_evict_min_idle;
-}
-
-int
-hev_config_get_misc_tcp_evict_min_idle (void)
-{
-    return tcp_evict_min_idle;
-}
-
-int
-hev_config_get_misc_udp_queue_frames (void)
-{
-    return udp_queue_frames;
-}
-
-int
-hev_config_get_misc_udp_queue_total_frames (void)
-{
-    return udp_queue_total_frames;
-}
-
-int
-hev_config_get_misc_udp_evict_protect_age (void)
-{
-    return udp_protect_age;
-}
-
-int
-hev_config_get_misc_udp_evict_protect_idle (void)
-{
-    return udp_protect_idle;
-}
-
-int
-hev_config_get_misc_tcp_evict_protect_age (void)
-{
-    return tcp_protect_age;
-}
-
-int
-hev_config_get_misc_tcp_evict_protect_idle (void)
-{
-    return tcp_protect_idle;
 }
 
 const char *

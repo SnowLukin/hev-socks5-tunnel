@@ -114,66 +114,11 @@ enum
 };
 
 /**
- * hev_socks5_tunnel_set_session_cap:
- * @type: one HEV_SOCKS5_TUNNEL_SESSION_* value
- * @max_live: most live sessions of this type, 0 for no cap, negative to
- *            restore misc.udp-max-sessions / misc.tcp-max-sessions
- * @evict_min_idle_ms: at the cap a new session closes the least recently
- *            active session of the same type if it has been silent at least
- *            this long, otherwise the new one is refused (TCP gets a reset,
- *            the UDP datagram is dropped); negative to restore
- *            misc.udp-evict-min-idle / misc.tcp-evict-min-idle
- *
- * Lowering the cap below the current count closes nothing by itself: the
- * extra sessions leave by timeout or hev_socks5_tunnel_relieve. Every tunnel
- * start applies the configured values again. Safe to call from any thread.
- *
- * Returns: zero, or -1 for an unknown type.
- */
-int hev_socks5_tunnel_set_session_cap (int type, int max_live,
-                                       int evict_min_idle_ms);
-
-/**
- * hev_socks5_tunnel_set_udp_queue_cap:
- * @per_session_frames: datagrams one UDP session may queue while its upstream
- *            is not ready, at most 513; zero or negative to restore
- *            misc.udp-queue-frames
- * @total_frames: datagrams queued in all UDP sessions together, 0 for no
- *            limit, negative to restore misc.udp-queue-total-frames
- *
- * A datagram over either cap is dropped and counted in udp_queue_dropped.
- * Every queued datagram holds a full-MTU buffer whatever its size. Every
- * tunnel start applies the configured values again. Safe to call from any
- * thread.
- *
- * Returns: zero, or -1 for invalid arguments.
- */
-int hev_socks5_tunnel_set_udp_queue_cap (int per_session_frames,
-                                         int total_frames);
-
-/**
- * hev_socks5_tunnel_set_evict_protect:
- * @type: one HEV_SOCKS5_TUNNEL_SESSION_* value
- * @min_age_ms: a session that got data from upstream and is at least this
- *            old counts as an established conversation; 0 turns it off
- * @min_idle_ms: an established conversation is evicted only when silent at
- *            least this long
- *
- * Eviction at the cap takes the least recently active session that is not
- * protected. Every tunnel start applies misc.udp-evict-protect-age /
- * misc.udp-evict-protect-idle (tcp- for TCP) again, off if they are not set.
- * Safe to call from any thread.
- *
- * Returns: zero, or -1 for invalid arguments.
- */
-int hev_socks5_tunnel_set_evict_protect (int type, int min_age_ms,
-                                         int min_idle_ms);
-
-/**
  * HevSocks5TunnelAdmission:
- * @HEV_SOCKS5_TUNNEL_ADMIT_OPEN: new sessions limited only by the caps
- * @HEV_SOCKS5_TUNNEL_ADMIT_HOLD: no growth, a new session only in place of
- *            a silent one of the same type (as at the cap)
+ * @HEV_SOCKS5_TUNNEL_ADMIT_OPEN: new sessions limited only by
+ *            misc.max-session-count
+ * @HEV_SOCKS5_TUNNEL_ADMIT_HOLD: no growth, a new session takes the place of
+ *            one of the same type, chosen as at misc.max-session-count
  * @HEV_SOCKS5_TUNNEL_ADMIT_CLOSED: no new sessions, live ones keep working
  */
 enum
@@ -182,19 +127,6 @@ enum
     HEV_SOCKS5_TUNNEL_ADMIT_HOLD = 1,
     HEV_SOCKS5_TUNNEL_ADMIT_CLOSED = 2,
 };
-
-/**
- * hev_socks5_tunnel_set_admission:
- * @types: HEV_SOCKS5_TUNNEL_SESSION_* mask
- * @state: HEV_SOCKS5_TUNNEL_ADMIT_*
- *
- * Admission state set by the caller. The stricter of this and the state
- * derived from the memory probe is in effect. Every tunnel start resets it to
- * OPEN. Safe to call from any thread.
- *
- * Returns: zero, or -1 for invalid arguments.
- */
-int hev_socks5_tunnel_set_admission (int types, int state);
 
 /**
  * HevSocks5TunnelMemoryProbe:
@@ -250,32 +182,6 @@ int hev_socks5_tunnel_set_memory_probe (HevSocks5TunnelMemoryProbe probe,
 int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
 
 /**
- * hev_socks5_tunnel_set_dns_priority:
- * @max_sessions: size of the DNS pool up to 32, 0 turns DNS priority off,
- *            negative to restore misc.dns-priority-sessions
- * @timeout_ms: read-write timeout of a DNS session, 1000 to 10000, zero or
- *            negative to restore misc.dns-priority-timeout (5000 if not set)
- * @addresses: comma separated IPv4 resolver addresses, at most 4; "any" for
- *            any address, NULL to restore misc.dns-priority-addresses
- *
- * New UDP flows to port 53 of these addresses go to a pool of their own: the
- * memory probe and the UDP cap do not apply to them, and they do not count
- * against the UDP cap. A full pool makes room by closing a session that has a
- * reply to every query, or one whose query has waited a second without a
- * reply; if all still wait, the new query takes the ordinary UDP path, where
- * the UDP cap and the memory probe apply. There it keeps the pool timeout and
- * is not protected from eviction as an established flow. Live sessions keep
- * the timeout they started with. Every tunnel start applies the configured
- * values again. Safe to call from any thread.
- *
- * An empty or invalid address list in the config turns the pool off.
- *
- * Returns: zero, or -1 for an invalid address list, size or timeout.
- */
-int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
-                                        const char *addresses);
-
-/**
  * HevSocks5TunnelSessionStats:
  * @size: set by the caller to sizeof (HevSocks5TunnelSessionStats)
  * @udp_live, @tcp_live: live sessions
@@ -283,14 +189,16 @@ int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
  * @udp_queued_frames: datagrams waiting in all UDP session queues
  * @admission_udp, @admission_tcp: admission state in effect,
  *            HEV_SOCKS5_TUNNEL_ADMIT_*
- * @udp_cap, @tcp_cap: caps in effect, 0 for none
+ * @udp_cap, @tcp_cap: always 0, there are no caps per type any more
  * @last_probe_kb: last memory probe result in KiB, negative if none
  * @*_created: sessions created since the tunnel start
- * @*_evicted: silent sessions closed to make room for a new one
- * @*_refused: new sessions refused by a cap or by admission
+ * @*_evicted: sessions closed to make room for a new one, at
+ *            misc.max-session-count or in HOLD
+ * @*_refused: new sessions refused by CLOSED admission
  * @*_relieved: sessions closed by hev_socks5_tunnel_relieve
- * @*_refused_adm: part of @*_refused due to HOLD or CLOSED admission
- * @udp_queue_dropped: datagrams dropped because a UDP queue was full
+ * @*_refused_adm: same as @*_refused
+ * @udp_queue_dropped: datagrams dropped because a UDP queue was full or the
+ *            buffer budget was used up
  * @probe_hold_ms, @probe_closed_ms: time the memory probe has kept
  *            HEV_SOCKS5_TUNNEL_ADMIT_HOLD and HEV_SOCKS5_TUNNEL_ADMIT_CLOSED
  * @dns_live, @dns_cap: live sessions in the DNS pool and its size, 0 if off
@@ -298,7 +206,14 @@ int hev_socks5_tunnel_set_dns_priority (int max_sessions, int timeout_ms,
  *            closed to make room, and queries that found the pool full of
  *            sessions waiting for a reply
  * @dns_overflow: part of @dns_refused that started as ordinary UDP sessions;
- *            the rest was refused by the UDP cap or the memory probe
+ *            the rest was refused by the memory probe
+ * @max_session_count: misc.max-session-count, 0 for none
+ * @buffer_limit, @buffer_used: misc.max-buffer-size (0: unlimited) and the
+ *            bytes charged to it
+ * @buffer_reclaimed: sessions closed because they held buffers without
+ *            progress while the budget was overcommitted
+ * @protected_live: sessions kept by misc.evict-protect-idle the last time
+ *            room was made
  *
  * A caller built against an older, shorter struct passes the smaller size and
  * gets the fields it knows.
@@ -326,6 +241,10 @@ typedef struct
     int dns_cap;
     unsigned long long dns_created, dns_evicted, dns_refused;
     unsigned long long dns_overflow;
+    int max_session_count;
+    int protected_live;
+    unsigned long long buffer_limit, buffer_used;
+    unsigned long long buffer_reclaimed;
 } HevSocks5TunnelSessionStats;
 
 /**

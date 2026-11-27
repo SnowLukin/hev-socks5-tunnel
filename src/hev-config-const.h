@@ -21,5 +21,13 @@
 #define COMPACT_PBUF_SIZE 2048
 #define TASK_STACK_SIZE 20480
 #define SESSION_IDLE_RELEASE_TIME 1000
+/* Charged per queued pbuf: its struct, headers and malloc overhead. */
+#define PBUF_CHARGE_OVERHEAD 128
+/* Sessions that hold buffers without progress for so long are reclaimed. */
+#define BUFFER_RECLAIM_IDLE_TIME 2000
+/* A session upstream answered is kept for so long to finish its handshake. */
+#define SESSION_EVICT_YOUNG_TIME 2000
+/* Datagrams queued by a session of the DNS pool, outside the buffer budget. */
+#define DNS_POOL_QUEUE_FRAMES 16
 
 #endif /* __HEV_CONFIG_CONST_H__ */
