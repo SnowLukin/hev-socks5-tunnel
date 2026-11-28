@@ -11,6 +11,7 @@
 
 #include "hev-utils.h"
 #include "hev-logger.h"
+#include "hev-compiler.h"
 #include "hev-config.h"
 #include "hev-config-const.h"
 #include "hev-socks5-client.h"
@@ -22,6 +23,7 @@ void
 hev_socks5_session_run (HevSocks5Session *self)
 {
     HevSocks5SessionIface *iface;
+    HevSocks5SessionData *sd;
     HevConfigServer *srv;
     int res;
 
@@ -56,6 +58,8 @@ hev_socks5_session_run (HevSocks5Session *self)
     iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
     if (HEV_SOCKS5 (self)->type != HEV_SOCKS5_TYPE_TCP)
         hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), "udp-association");
+    sd = container_of (iface->get_node (self), HevSocks5SessionData, node);
+    sd->relaying = 1;
     iface->splicer (self);
 }
 
@@ -69,6 +73,46 @@ hev_socks5_session_terminate (HevSocks5Session *self)
     iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
     hev_socks5_set_timeout (HEV_SOCKS5 (self), 0);
     hev_task_wakeup (iface->get_task (self));
+}
+
+/*
+ * Drop what the session holds in lwIP right away, if it can, and abort it, it
+ * is ended by its task later. The caller holds the lwIP mutex.
+ */
+void
+hev_socks5_session_release (HevSocks5Session *self)
+{
+    HevSocks5SessionIface *iface;
+
+    LOG_D ("%p socks5 session release", self);
+
+    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
+    if (iface->release)
+        iface->release (self);
+    hev_socks5_session_abort (self);
+}
+
+/*
+ * End the session, and reset the upstream connection: what is left in its
+ * buffers is dropped instead of being kept until it is sent.
+ *
+ * Not during the socks5 handshake, nothing is buffered then: the Xray socks
+ * inbound (26.9) crashes on a reset while it answers a UDP ASSOCIATE, and
+ * under a surge sessions are evicted that early.
+ */
+void
+hev_socks5_session_abort (HevSocks5Session *self)
+{
+    HevSocks5SessionIface *iface;
+    HevSocks5SessionData *sd;
+    int fd = HEV_SOCKS5 (self)->fd;
+
+    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
+    sd = container_of (iface->get_node (self), HevSocks5SessionData, node);
+    if (fd >= 0 && sd->relaying)
+        set_sock_abort_on_close (fd);
+
+    hev_socks5_session_terminate (self);
 }
 
 /*
@@ -91,7 +135,7 @@ hev_socks5_session_idle_wait (HevSocks5Session *self, int released)
     if (!released && (timeout < 0 || timeout > SESSION_IDLE_RELEASE_TIME)) {
         remain = hev_task_sleep (SESSION_IDLE_RELEASE_TIME);
         if (remain > 0)
-            goto woken;
+            return 0;
 
         hev_task_release_stack (hev_task_self ());
         return 1;
@@ -99,7 +143,7 @@ hev_socks5_session_idle_wait (HevSocks5Session *self, int released)
 
     if (timeout < 0) {
         hev_task_yield (HEV_TASK_WAITIO);
-        goto woken;
+        return 0;
     }
 
     /* The timeout may be changed (terminate) while sleeping. */
@@ -112,8 +156,6 @@ hev_socks5_session_idle_wait (HevSocks5Session *self, int released)
         return -1;
     }
 
-woken:
-    hev_socks5_tunnel_update_session (hev_socks5_session_get_node (self));
     return 0;
 }
 
@@ -155,6 +197,7 @@ hev_socks5_session_bind (HevSocks5 *self, int fd, const struct sockaddr *dest)
     }
 
     set_sock_tcp_fastopen (fd, srv->fastopen);
+    set_sock_tcp_buffer (fd, hev_config_get_misc_tcp_socket_buffer_size ());
 
     return 0;
 }

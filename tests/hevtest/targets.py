@@ -8,10 +8,16 @@ Runs inside the server environment (stdlib only).  Everything listens on
   TCP 7003 source         UDP 7003 source  ("SRC <size> <seconds>\\n")
   TCP 7004 digest  (read to EOF, answer "<bytes> <sha256>\\n")
   TCP 7005 count   (read to EOF, answer "<bytes>\\n")
+  TCP 7006 hold    (accept, never read nor write, close on peer hangup)
   TCP 7007 ping    (echo, one thread for all connections)
+                          UDP 7008 peer    (answers "<address> <port>" it saw)
+  TCP 7009 slow    (echo, the first answer after 0.3-0.8 s like a handshake,
+                    or after <ms> if the first request is "d<ms>"; for
+                    "t<a>,<b>" "a" after <a> ms, then "b" after <b> more)
   TCP 7100 ctrl    ("udp-sink\\n" -> "<bytes> <packets>\\n", then resets)
 """
 import hashlib
+import random
 import socket
 import threading
 import time
@@ -19,6 +25,38 @@ import time
 BUF = 256 * 1024
 stats = {"bytes": 0, "pkts": 0}
 stats_lock = threading.Lock()
+
+
+def tcp_hold(port):
+    """Accepted connections are kept, without a thread, and never read, so
+    whatever the peer sends piles up in front of them.  They are closed when
+    the peer hangs up."""
+    import select
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    s.bind(("::", port))
+    s.listen(4096)
+    hup = select.POLLRDHUP | select.POLLHUP | select.POLLERR
+
+    def loop():
+        p = select.poll()
+        p.register(s, select.POLLIN)
+        held = {}
+        while True:
+            for fd, ev in p.poll():
+                if fd == s.fileno():
+                    try:
+                        c, _ = s.accept()
+                    except OSError:
+                        continue
+                    held[c.fileno()] = c
+                    p.register(c, hup)
+                elif ev & hup:
+                    p.unregister(fd)
+                    held.pop(fd).close()
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def tcp_ping(port):
@@ -118,6 +156,25 @@ def h_echo(c):
         c.sendall(d)
 
 
+def h_slow(c):
+    d = c.recv(BUF)
+    if not d:
+        return
+    if d.startswith(b"t"):
+        first, rest = (int(x) / 1000.0 for x in d[1:].split(b","))
+        time.sleep(first)
+        c.sendall(b"a")
+        time.sleep(rest)
+        c.sendall(b"b")
+        return
+    if d.startswith(b"d") and d[1:].isdigit():
+        time.sleep(int(d[1:]) / 1000.0)
+    else:
+        time.sleep(random.uniform(0.3, 0.8))
+    c.sendall(d)
+    h_echo(c)
+
+
 def h_sink(c):
     buf = bytearray(BUF)
     while c.recv_into(buf):
@@ -184,6 +241,12 @@ def u_sink(s):
             stats["pkts"] += 1
 
 
+def u_peer(s):
+    while True:
+        _, a = s.recvfrom(65535)
+        s.sendto(("%s %d" % a[:2]).encode(), a)
+
+
 def u_source(s):
     while True:
         d, a = s.recvfrom(65535)
@@ -216,11 +279,16 @@ def main():
     tcp_listener(7003, h_source)
     tcp_listener(7004, h_digest)
     tcp_listener(7005, h_count)
+    tcp_hold(7006)
     tcp_ping(7007)
+    tcp_listener(7009, h_slow)
     tcp_listener(7100, h_ctrl)
     udp_listener(7001, u_echo)
     udp_listener(7002, u_sink)
     udp_listener(7003, u_source)
+    udp_listener(7008, u_peer)
+    # a resolver for the DNS pool (misc.dns-priority-addresses)
+    udp_listener(53, u_echo)
     print("READY", flush=True)
     threading.Event().wait()
 

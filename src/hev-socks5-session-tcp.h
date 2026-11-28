@@ -32,6 +32,9 @@ struct _HevSocks5SessionTCP
     struct tcp_pcb *pcb;
     HevTaskMutex *mutex;
     HevRingBuffer *buffer;
+    unsigned int window;
+    /* Bytes in queue under a buffer budget, its tot_len wraps past 64K. */
+    unsigned int queued;
     int pcb_eof;
 };
 

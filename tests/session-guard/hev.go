@@ -25,6 +25,8 @@ static long long fake_avail = -1;
 static unsigned int stats_guard_size(void) { return offsetof(HevSocks5TunnelSessionStats, dns_live); }
 // Size a caller built before dns_overflow passes.
 static unsigned int stats_pool_size(void) { return offsetof(HevSocks5TunnelSessionStats, dns_overflow); }
+// Size a caller built before max_session_count passes.
+static unsigned int stats_budget_size(void) { return offsetof(HevSocks5TunnelSessionStats, max_session_count); }
 // Calls with that size over a struct filled with 0xab: hev must accept it, report the size back
 // and leave every byte after it alone.
 static int stats_old_caller(unsigned int size, unsigned int *out_size, int *untouched) {
@@ -40,9 +42,6 @@ static int stats_old_caller(unsigned int size, unsigned int *out_size, int *unto
         if (p[i] != 0xab)
             *untouched = 0;
     return r;
-}
-static int set_dns_priority(int max_sessions, int timeout_ms, const char *addresses) {
-    return hev_socks5_tunnel_set_dns_priority(max_sessions, timeout_ms, addresses);
 }
 static long long probe_calls;
 static long long fake_probe(void *user_data) {
@@ -90,6 +89,9 @@ type sessionStats struct {
 	dnsLive, dnsCap                    int
 	dnsCreated, dnsEvicted, dnsRefused uint64
 	dnsOverflow                        uint64
+	maxSessionCount, protectedLive     int
+	bufferLimit, bufferUsed            uint64
+	bufferReclaimed                    uint64
 }
 
 func startHev(cfg string, fd int) int {
@@ -102,18 +104,6 @@ func quitHev() { C.hev_socks5_tunnel_quit() }
 
 func relieve(types, idleMs, maxCount int) int {
 	return int(C.hev_socks5_tunnel_relieve(C.int(types), C.int(idleMs), C.int(maxCount)))
-}
-
-func setSessionCap(typ, maxLive, idleMs int) int {
-	return int(C.hev_socks5_tunnel_set_session_cap(C.int(typ), C.int(maxLive), C.int(idleMs)))
-}
-
-func setAdmission(types, state int) int {
-	return int(C.hev_socks5_tunnel_set_admission(C.int(types), C.int(state)))
-}
-
-func setEvictProtect(typ, ageMs, idleMs int) int {
-	return int(C.hev_socks5_tunnel_set_evict_protect(C.int(typ), C.int(ageMs), C.int(idleMs)))
 }
 
 func setProbeTypes(hold, close int) int {
@@ -153,7 +143,10 @@ func stats() (sessionStats, bool) {
 		probeHoldMs:     uint64(s.probe_hold_ms), probeClosedMs: uint64(s.probe_closed_ms),
 		dnsLive: int(s.dns_live), dnsCap: int(s.dns_cap),
 		dnsCreated: uint64(s.dns_created), dnsEvicted: uint64(s.dns_evicted), dnsRefused: uint64(s.dns_refused),
-		dnsOverflow: uint64(s.dns_overflow),
+		dnsOverflow:     uint64(s.dns_overflow),
+		maxSessionCount: int(s.max_session_count), protectedLive: int(s.protected_live),
+		bufferLimit: uint64(s.buffer_limit), bufferUsed: uint64(s.buffer_used),
+		bufferReclaimed: uint64(s.buffer_reclaimed),
 	}, true
 }
 
@@ -163,22 +156,13 @@ func socketpair() (int, int) {
 	return int(fds[0]), int(fds[1])
 }
 
-func statsGuardSize() int { return int(C.stats_guard_size()) }
-func statsPoolSize() int  { return int(C.stats_pool_size()) }
+func statsGuardSize() int  { return int(C.stats_guard_size()) }
+func statsPoolSize() int   { return int(C.stats_pool_size()) }
+func statsBudgetSize() int { return int(C.stats_budget_size()) }
 
 func statsCallerWithSize(size int) (ret int, got int, untouched bool) {
 	var sz C.uint
 	var un C.int
 	ret = int(C.stats_old_caller(C.uint(size), &sz, &un))
 	return ret, int(sz), un != 0
-}
-
-// setDnsPriority: addresses nil -> NULL (restore the config value).
-func setDnsPriority(maxSessions, timeoutMs int, addresses *string) int {
-	if addresses == nil {
-		return int(C.set_dns_priority(C.int(maxSessions), C.int(timeoutMs), nil))
-	}
-	cs := C.CString(*addresses)
-	defer C.free(unsafe.Pointer(cs))
-	return int(C.set_dns_priority(C.int(maxSessions), C.int(timeoutMs), cs))
 }

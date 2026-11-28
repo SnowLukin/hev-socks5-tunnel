@@ -1,13 +1,16 @@
-// Смоук hev кита (срез macosx arm64) с серией r9: gVisor netstack <-> socketpair (формат utun) <-> hev <-> socksd.
+// Смоук hev кита (срез macosx arm64): gVisor netstack <-> socketpair (формат utun) <-> hev <-> socksd.
 // Часть 1 - проверки r8: relieve, гонка relieve с остановкой.
-// Часть 3 - пул DNS (0009, 0011): D - пул под потолком UDP, HOLD и CLOSED, адреса из списка и мимо
-// него, вытеснение и отказ в полном пуле, свой таймаут, сеттер, старый размер статистики; D6 - запрос
-// сверх полного пула идёт обычным путём UDP; O - такой запрос живёт по таймауту пула и без защиты
-// установившихся; F - правки по ревью пула.
-// Часть 2 - guard: потолки из конфига, вытеснение молчащих, отказ TCP сбросом, внешний приём,
-// колбэк памяти (CLOSED / HOLD / OPEN с гистерезисом, типы колбэка), защита установившихся из
-// ключей конфига (патч 0008) и повторное чтение конфига на перезапуске, размер статистики.
-// Число сессий в части 1 читается из строки лога hev "relieve ... udp U tcp T of N", в части 2 -
+// Часть 2 - бюджет сессий: G1 одна таблица max-session-count, у потолка новая сессия вытесняет давнее
+// всех активную и не получает отказ; G2 TCP в той же таблице, сессию отдаёт тип с половиной таблицы и
+// больше; G3 защита evict-protect-idle и её конец; G4 защищённые держат не больше половины таблицы, G9
+// и когда часть их другого типа; G7 молодой поток с ответом держится 2 с; G5 колбэк памяти (HOLD
+// вытесняет сессию своего типа вместо отказа, CLOSED отказывает, гистерезис, типы колбэка); G6
+// повторное чтение конфига на перезапуске; K5, H5, K6, W4 правки по ревью колбэка.
+// Часть 3 - пул DNS (0009, 0011): D - пул мимо полной таблицы, HOLD и CLOSED, адреса из списка и мимо
+// него, вытеснение и отказ в полном пуле, свой таймаут, старый размер статистики; D6 - запрос сверх
+// полного пула идёт обычным путём UDP; O - такой запрос живёт по таймауту пула и без защиты; F -
+// правки по ревью пула.
+// Число сессий в части 1 читается из строки лога hev "relieve ... udp U tcp T of N", в частях 2 и 3 -
 // из hev_socks5_tunnel_get_session_stats.
 package main
 
@@ -382,71 +385,295 @@ func partR8() {
 	check("race: relieve succeeded while running", okCalls.Load() > 0, fmt.Sprintf("ok=%d fail=%d", okCalls.Load(), failCalls.Load()))
 }
 
-func partGuard() {
-	check("stats refuse a too small size", statsWithSize(8) == -1, "")
+// stillLive: эхо прошло на старой сессии hev, новая UDP не создавалась.
+func stillLive(c *gonet.UDPConn, msg string) bool {
+	before := mustStats().udpCreated
+	return udpEcho(c, msg) && mustStats().udpCreated == before
+}
 
-	// G1. Потолки из конфига: UDP 4, TCP 2, вытеснение UDP после 1 с тишины.
-	caps := "  udp-max-sessions: 4\n  tcp-max-sessions: 2\n  udp-evict-min-idle: 1000\n  tcp-evict-min-idle: 60000\n" +
-		"  udp-queue-frames: 64\n  udp-queue-total-frames: 1024\n"
-	r := newRig(cfg(caps))
+// reborn: старой сессии потока уже нет, эхо пришло через новую.
+func reborn(c *gonet.UDPConn, msg string) bool {
+	before := mustStats().udpCreated
+	return udpEcho(c, msg) && mustStats().udpCreated == before+1
+}
+
+func noReply(cs []*gonet.UDPConn, tag string) {
+	for i, c := range cs {
+		c.Write([]byte(fmt.Sprintf("NOREPLY-%s-%d", tag, i)))
+	}
+}
+
+// G1, G2. Одна таблица UDP и TCP на max-session-count 4: новый поток у потолка вытесняет давнее
+// всех активный из типов, что держат половину таблицы и больше, и никогда не получает отказ.
+func partTable() {
+	check("stats refuse a too small size", statsWithSize(8) == -1, "")
+	r := newRig(cfg("  max-session-count: 4\n  max-buffer-size: 1048576\n"))
 	s := mustStats()
-	check("G1 caps come from config", s.udpCap == 4 && s.tcpCap == 2, fmt.Sprintf("udp_cap=%d tcp_cap=%d", s.udpCap, s.tcpCap))
+	check("G1 stats show max-session-count and max-buffer-size from config, no caps per type",
+		s.maxSessionCount == 4 && s.udpCap == 0 && s.tcpCap == 0 && s.bufferLimit == 1048576,
+		fmt.Sprintf("max=%d udp_cap=%d tcp_cap=%d buffer_limit=%d", s.maxSessionCount, s.udpCap, s.tcpCap, s.bufferLimit))
 
 	first := r.openUDP(4, 22000)
 	check("G1 4 udp flows echo", allEcho(first, "g1"), "")
 	extra := r.openUDP(2, 22100)
-	got := burstEcho(extra, "g1x")
+	ok := udpEcho(extra[0], "g1x0") && udpEcho(extra[1], "g1x1")
 	s = mustStats()
-	check("G1 flows over the cap are refused while others are active", got == 0 && s.udpLive == 4 && s.udpRefused >= 2,
-		fmt.Sprintf("echo=%d live=%d refused=%d", got, s.udpLive, s.udpRefused))
-	check("G1 live flows still echo", allEcho(first, "g1b"), "")
-
-	// G2. После 1 с тишины новая сессия вытесняет самую давно молчащую.
-	time.Sleep(1200 * time.Millisecond)
-	evictor := r.openUDP(1, 22200)
-	ok := udpEcho(evictor[0], "g2")
+	check("G1 new flows at the cap get in, the table stays at exactly 4",
+		ok && s.udpLive == 4 && s.udpEvicted == 2 && s.udpRefused == 0,
+		fmt.Sprintf("echo=%v live=%d evicted=%d refused=%d", ok, s.udpLive, s.udpEvicted, s.udpRefused))
+	check("G1 the more recently active flows kept their sessions",
+		stillLive(first[2], "g1k2") && stillLive(first[3], "g1k3") && stillLive(extra[0], "g1k4") && stillLive(extra[1], "g1k5"), "")
+	b := mustStats()
+	ok = reborn(first[0], "g1r")
 	s = mustStats()
-	check("G2 new flow replaces a silent one", ok && s.udpLive == 4 && s.udpEvicted >= 1,
-		fmt.Sprintf("echo=%v live=%d evicted=%d", ok, s.udpLive, s.udpEvicted))
+	check("G1 the least recently active flow was the one evicted",
+		ok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 4,
+		fmt.Sprintf("echo=%v evicted=%d->%d live=%d", ok, b.udpEvicted, s.udpEvicted, s.udpLive))
 
-	// G3. Потолок TCP: третье соединение получает сброс, первые два живы.
-	t1, t2 := r.dialTCP(), r.dialTCP()
-	check("G3 two tcp under the cap echo", t1 != nil && t2 != nil && tcpEcho(t1, "t1") && tcpEcho(t2, "t2"), "")
+	b = mustStats()
+	bf := r.openUDP(4, 22300)
+	got := burstEcho(bf, "g1b")
+	s = mustStats()
+	check("G1 a burst of 4 new flows on a full table replaces the 4 old ones, none refused",
+		got == 4 && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+4 && s.udpRefused == 0,
+		fmt.Sprintf("echo=%d/4 live=%d evicted=%d->%d refused=%d", got, s.udpLive, b.udpEvicted, s.udpEvicted, s.udpRefused))
+
+	// G2. TCP в той же таблице. Сессию у потолка отдаёт только тип, который держит половину таблицы и
+	// больше: шторм одного типа не забирает у другого его половину.
+	// Порядок активности bf[0] < bf[1] < bf[2] < bf[3].
+	ok = true
+	for i, c := range bf {
+		ok = stillLive(c, fmt.Sprintf("g2o%d", i)) && ok
+	}
+	check("G2 the burst flows answer one by one", ok, "")
+	b = mustStats()
+	t1 := r.dialTCP()
+	ok = t1 != nil && tcpEcho(t1, "t1")
+	s = mustStats()
+	check("G2 tcp under half of the table takes the place of the least recently active udp",
+		ok && s.tcpLive == 1 && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+1 && s.tcpEvicted == 0,
+		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d evicted=%d->%d", ok, s.tcpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
+	// Теперь t1 давнее всех активна: при общем LRU новый UDP вытеснил бы её.
+	ok = true
+	for i, c := range bf[1:] {
+		ok = stillLive(c, fmt.Sprintf("g2u%d", i)) && ok
+	}
+	check("G2 the udp flows after the evicted one kept their sessions", ok, "")
+	b = mustStats()
+	n := r.openUDP(1, 22200)
+	ok = udpEcho(n[0], "g2n")
+	t1ok := tcpEcho(t1, "t1b")
+	s = mustStats()
+	check("G2 udp over half of the table evicts its own flow, not the less recently active tcp connection",
+		ok && t1ok && s.tcpEvicted == 0 && s.tcpLive == 1 && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+1,
+		fmt.Sprintf("echo=%v tcp=%v tcp_evicted=%d tcp_live=%d udp_live=%d", ok, t1ok, s.tcpEvicted, s.tcpLive, s.udpLive))
+	t2 := r.dialTCP()
+	ok = t2 != nil && tcpEcho(t2, "t2")
 	t3 := r.dialTCP()
-	t3ok := t3 != nil && tcpEcho(t3, "t3")
+	ok = ok && t3 != nil && tcpEcho(t3, "t3")
 	s = mustStats()
-	check("G3 tcp over the cap is reset", !t3ok && s.tcpRefused >= 1 && s.tcpLive == 2,
-		fmt.Sprintf("echo=%v refused=%d live=%d", t3ok, s.tcpRefused, s.tcpLive))
-	check("G3 tcp under the cap keeps working", tcpEcho(t1, "t1b") && tcpEcho(t2, "t2b"), "")
-
-	// G4. Внешний приём: CLOSED для UDP закрывает новые, живые работают, OPEN возвращает.
-	check("G4 set_admission(udp, closed)", setAdmission(sessUDP, admitClosed) == 0, "")
-	time.Sleep(1200 * time.Millisecond)
-	blocked := r.openUDP(1, 22300)
-	bok := udpEcho(blocked[0], "g4")
+	check("G2 with both types at half the least recently active session of the table goes, here an udp flow",
+		ok && s.tcpLive == 3 && s.udpLive == 1 && s.tcpEvicted == 0,
+		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d tcp_evicted=%d", ok, s.tcpLive, s.udpLive, s.tcpEvicted))
+	b = mustStats()
+	t4 := r.dialTCP()
+	ok = t4 != nil && tcpEcho(t4, "t4")
+	t2ok := tcpEcho(t2, "t2b")
+	t1ok = tcpEcho(t1, "t1c")
 	s = mustStats()
-	check("G4 closed admission refuses a new udp flow even with silent ones", !bok && s.admUDP == admitClosed && s.udpRefusedAdm >= 1,
-		fmt.Sprintf("echo=%v adm_udp=%d refused_adm=%d", bok, s.admUDP, s.udpRefusedAdm))
-	check("G4 live udp flow echoes while closed", udpEcho(evictor[0], "g4live"), "")
-	check("G4 set_admission(udp, open)", setAdmission(sessUDP, admitOpen) == 0, "")
-	time.Sleep(1200 * time.Millisecond)
-	reopened := r.openUDP(1, 22400)
-	check("G4 open admission lets a new flow in again", udpEcho(reopened[0], "g4open"), "")
-	check("G4 invalid admission is rejected", setAdmission(sessUDP, 3) == -1 && setAdmission(4, admitOpen) == -1, "")
+	check("G2 tcp over half evicts its own least recently active connection, the udp flow under half stays",
+		ok && !t1ok && t2ok && s.tcpEvicted == 1 && s.tcpLive == 3 && s.udpLive == 1 && s.udpEvicted == b.udpEvicted &&
+			stillLive(n[0], "g2k"),
+		fmt.Sprintf("echo=%v t1=%v t2=%v tcp_evicted=%d tcp_live=%d udp_live=%d udp_evicted=%d->%d",
+			ok, t1ok, t2ok, s.tcpEvicted, s.tcpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
+	r.quit("table")
+}
 
-	// G5. Колбэк памяти: HOLD только UDP, CLOSED UDP и TCP, пороги 12 / 8 МБ, гистерезис 2 МБ.
-	check("G5 raise caps for the probe test", setSessionCap(sessUDP, 16, 1000) == 0 && setSessionCap(sessTCP, 16, 60000) == 0, "")
+// Защита из evict-protect-idle 4000: поток с ответом, который говорил хотя бы через 2 с после
+// создания, не вытесняется, пока молчит меньше 4 с. Поток с ответом моложе 2 с тоже держится.
+const protectConf = "  max-session-count: 4\n  evict-protect-idle: 4000\n"
+
+// G3. Ответивший и ещё говорящий поток защищён, вытесняется молчащий; защита кончается через
+// evict-protect-idle тишины.
+func partProtect() {
+	r := newRig(cfg(protectConf))
+	s := mustStats()
+	check("G6 restart re-reads the config and resets counters",
+		s.maxSessionCount == 4 && s.bufferLimit == 0 && s.udpCreated == 0 && s.udpEvicted == 0,
+		fmt.Sprintf("max=%d buffer_limit=%d created=%d evicted=%d", s.maxSessionCount, s.bufferLimit, s.udpCreated, s.udpEvicted))
+
+	a := r.openUDP(1, 23000)[0]
+	check("G3 talker answers", udpEcho(a, "g3a"), "")
+	time.Sleep(2500 * time.Millisecond)
+	check("G3 talker still talks 2.5 s after it started", udpEcho(a, "g3a2"), "")
+	others := r.openUDP(3, 23100)
+	check("G3 3 one-shot flows echo after it", allEcho(others, "g3o"), "")
+	// Одноразовые потоки старше 2 с, говорящий молчит 2.5 с из 4 и при этом давнее всех активен.
+	time.Sleep(2500 * time.Millisecond)
+	b := mustStats()
+	e := r.openUDP(1, 23200)[0]
+	ok := udpEcho(e, "g3e")
+	s = mustStats()
+	check("G3 a new flow at the cap evicts a silent one-shot flow, not the protected talker",
+		ok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 4 && s.protectedLive == 1,
+		fmt.Sprintf("echo=%v evicted=%d->%d live=%d protected=%d", ok, b.udpEvicted, s.udpEvicted, s.udpLive, s.protectedLive))
+	check("G3 the evicted one was the least recently active one-shot flow", reborn(others[0], "g3r"), "")
+
+	// Говорящий молчит 5 с из 4: защиты больше нет, он давнее всех активен и уходит первым.
+	time.Sleep(2500 * time.Millisecond)
+	b = mustStats()
+	f := r.openUDP(1, 23300)[0]
+	ok = udpEcho(f, "g3f")
+	s = mustStats()
+	check("G3 after evict-protect-idle of silence the talker is no longer protected",
+		ok && s.udpEvicted == b.udpEvicted+1 && s.protectedLive == 0 && reborn(a, "g3a3"),
+		fmt.Sprintf("echo=%v evicted=%d->%d protected=%d", ok, b.udpEvicted, s.udpEvicted, s.protectedLive))
+	r.quit("protect")
+}
+
+// G4. Защищённые держат не больше половины таблицы: при всех защищённых новый поток всё равно входит,
+// а защищённых остаётся 2 из 4.
+func partProtectHalf() {
+	r := newRig(cfg(protectConf))
+	talkers := r.openUDP(4, 23400)
+	check("G4 4 flows echo", allEcho(talkers, "g4"), "")
+	time.Sleep(2500 * time.Millisecond)
+	check("G4 4 flows still talk 2.5 s after they started", allEcho(talkers, "g4b"), "")
+	var prot []int
+	ok := true
+	for i, c := range r.openUDP(4, 23500) {
+		ok = udpEcho(c, fmt.Sprintf("g4n-%d", i)) && ok
+		prot = append(prot, mustStats().protectedLive)
+	}
+	s := mustStats()
+	check("G4 with all flows protected new flows still get in",
+		ok && s.udpLive == 4 && s.udpEvicted == 4 && s.udpRefused == 0,
+		fmt.Sprintf("echo=%v live=%d evicted=%d refused=%d", ok, s.udpLive, s.udpEvicted, s.udpRefused))
+	check("G4 protected flows are evicted down to half of the table and no further",
+		len(prot) == 4 && prot[0] == 4 && prot[1] == 3 && prot[2] == 2 && prot[3] == 2, fmt.Sprintf("protected=%v", prot))
+	check("G4 the two most recently active protected flows kept their sessions",
+		stillLive(talkers[2], "g4k2") && stillLive(talkers[3], "g4k3"), "")
+	r.quit("protect-half")
+}
+
+// G9. Квота защищённых общая на таблицу: защищённые UDP меньше половины не вытесняются, но занимают
+// свою долю квоты, поэтому защищённые TCP уходят, пока защищённых в таблице не станет половина.
+func partProtectShared() {
+	r := newRig(cfg(protectConf))
+	u := r.openUDP(1, 24150)[0]
+	ts := []net.Conn{r.dialTCP(), r.dialTCP(), r.dialTCP()}
+	ok := udpEcho(u, "g9u")
+	for i, t := range ts {
+		ok = ok && t != nil && tcpEcho(t, fmt.Sprintf("g9t%d", i))
+	}
+	check("G9 1 udp flow and 3 tcp connections echo", ok, "")
+	time.Sleep(2500 * time.Millisecond)
+	ok = udpEcho(u, "g9u2")
+	for i, t := range ts {
+		ok = ok && tcpEcho(t, fmt.Sprintf("g9t2-%d", i))
+	}
+	check("G9 all 4 still talk 2.5 s after they started", ok, "")
+	n1 := r.dialTCP()
+	ok = n1 != nil && tcpEcho(n1, "g9n1")
+	s := mustStats()
+	check("G9 a new tcp evicts a protected tcp, 3 protected of 4 were over half of the table",
+		ok && s.tcpEvicted == 1 && s.udpEvicted == 0 && s.protectedLive == 4,
+		fmt.Sprintf("echo=%v tcp_evicted=%d udp_evicted=%d protected=%d", ok, s.tcpEvicted, s.udpEvicted, s.protectedLive))
+	n2 := r.dialTCP()
+	ok = n2 != nil && tcpEcho(n2, "g9n2")
+	n1ok := tcpEcho(n1, "g9n1b")
+	s = mustStats()
+	check("G9 the next one evicts a protected tcp too, not the new unprotected one",
+		ok && n1ok && s.tcpEvicted == 2 && s.udpEvicted == 0 && s.protectedLive == 3 && stillLive(u, "g9u3"),
+		fmt.Sprintf("echo=%v n1=%v tcp_evicted=%d udp_evicted=%d protected=%d", ok, n1ok, s.tcpEvicted, s.udpEvicted, s.protectedLive))
+	r.quit("protect-shared")
+}
+
+// G7. Поток с одним обменом молод 2 с и держится, потом не защищён. Остальные места заняты потоками
+// без ответа: они не молоды и не защищены, вытесняется один из них, если одноразовый держится.
+func partYoung() {
+	r := newRig(cfg(protectConf))
+	a := r.openUDP(1, 23600)[0]
+	check("G7 one-shot flow answers", udpEcho(a, "g7a"), "")
+	noReply(r.openUDP(3, 23700), "g7")
+	time.Sleep(200 * time.Millisecond)
+	b := mustStats()
+	ok := udpEcho(r.openUDP(1, 23800)[0], "g7e")
+	s := mustStats()
+	check("G7 a flow answered under 2 s ago is kept, an unanswered one is evicted",
+		ok && b.udpLive == 4 && s.udpEvicted == b.udpEvicted+1 && stillLive(a, "g7a2"),
+		fmt.Sprintf("echo=%v live=%d evicted=%d->%d", ok, b.udpLive, b.udpEvicted, s.udpEvicted))
+
+	_, relieved := relieveAndWait(reliefUDP, 0, 0)
+	time.Sleep(300 * time.Millisecond)
+	check("G7 relieve clears the table", relieved && mustStats().udpLive == 0, "")
+	a = r.openUDP(1, 23900)[0]
+	check("G7 second one-shot flow answers", udpEcho(a, "g7b"), "")
+	noReply(r.openUDP(3, 24000), "g7b")
+	time.Sleep(2500 * time.Millisecond)
+	b = mustStats()
+	ok = udpEcho(r.openUDP(1, 24100)[0], "g7f")
+	s = mustStats()
+	check("G7 2.5 s later the one-shot flow is neither young nor protected and goes first",
+		ok && b.udpLive == 4 && s.udpEvicted == b.udpEvicted+1 && reborn(a, "g7b2"),
+		fmt.Sprintf("echo=%v live=%d evicted=%d->%d", ok, b.udpLive, b.udpEvicted, s.udpEvicted))
+	r.quit("young")
+}
+
+// G5. Колбэк памяти: HOLD только UDP, CLOSED UDP и TCP, пороги 12 / 8 МБ, гистерезис 2 МБ.
+func partProbe() {
+	r := newRig(cfg("  max-session-count: 16\n"))
+	udps := r.openUDP(3, 24200)
+	t1, t2 := r.dialTCP(), r.dialTCP()
+	check("G5 3 udp and 2 tcp echo", allEcho(udps, "g5") && t1 != nil && t2 != nil && tcpEcho(t1, "t1") && tcpEcho(t2, "t2"), "")
 	check("G5 probe types hold=udp close=all", setProbeTypes(sessUDP, sessUDP|sessTCP) == 0, "")
-	setFakeAvailKB(5 * 1024)
+	setFakeAvailKB(11 * 1024)
 	check("G5 probe on", probeOn(0, 12*1024, 8*1024, 2*1024, 1000, 0) == 0, "")
 	time.Sleep(100 * time.Millisecond)
-	c1 := r.openUDP(1, 22500)
-	c1ok := udpEcho(c1[0], "g5c")
+
+	b := mustStats()
+	hold := r.openUDP(2, 24300)
+	ok := udpEcho(hold[0], "g5h0") && udpEcho(hold[1], "g5h1")
+	s := mustStats()
+	check("G5 hold: new udp flows get in in place of live udp, udp does not grow",
+		ok && s.admUDP == admitHold && s.admTCP == admitOpen && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+2 &&
+			s.udpRefused == b.udpRefused && s.udpRefusedAdm == b.udpRefusedAdm,
+		fmt.Sprintf("echo=%v adm=%d/%d udp_live=%d evicted=%d->%d refused=%d->%d refused_adm=%d->%d", ok, s.admUDP, s.admTCP,
+			s.udpLive, b.udpEvicted, s.udpEvicted, b.udpRefused, s.udpRefused, b.udpRefusedAdm, s.udpRefusedAdm))
+	check("G5 hold for udp does not evict tcp", s.tcpLive == 2 && s.tcpEvicted == 0 && tcpEcho(t1, "t1h") && tcpEcho(t2, "t2h"),
+		fmt.Sprintf("tcp_live=%d tcp_evicted=%d", s.tcpLive, s.tcpEvicted))
+	check("G5 hold evicted the least recently active udp flows", reborn(udps[0], "g5r"), "")
+	t3 := r.dialTCP()
+	ok = t3 != nil && tcpEcho(t3, "t3")
+	s = mustStats()
+	check("G5 tcp still grows while udp holds", ok && s.tcpLive == 3 && s.udpLive == 3,
+		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d", ok, s.tcpLive, s.udpLive))
+
+	_, relieved := relieveAndWait(reliefUDP, 0, 0)
+	time.Sleep(300 * time.Millisecond)
+	s = mustStats()
+	check("G5 relieve closes all udp", relieved && s.udpLive == 0, fmt.Sprintf("live=%d", s.udpLive))
+	b = s
+	ok = udpEcho(r.openUDP(1, 24400)[0], "g5e")
+	s = mustStats()
+	check("G5 hold with no live udp admits a new one", ok && s.admUDP == admitHold && s.udpLive == 1 && s.udpEvicted == b.udpEvicted,
+		fmt.Sprintf("echo=%v adm=%d live=%d evicted=%d->%d", ok, s.admUDP, s.udpLive, b.udpEvicted, s.udpEvicted))
+
+	setFakeAvailKB(5 * 1024)
+	time.Sleep(100 * time.Millisecond)
+	b = mustStats()
+	c1 := r.openUDP(1, 24500)
+	c1ok := udpEchoWithin(c1[0], "g5c", refusedWait)
 	t4 := r.dialTCP()
 	t4ok := t4 != nil && tcpEcho(t4, "t4")
 	s = mustStats()
-	check("G5 below close: new udp and tcp refused", !c1ok && !t4ok && s.admUDP == admitClosed && s.admTCP == admitClosed,
-		fmt.Sprintf("udp=%v tcp=%v adm=%d/%d probe_kb=%d", c1ok, t4ok, s.admUDP, s.admTCP, s.lastProbeKB))
+	check("G5 below close: new udp and tcp refused and counted",
+		!c1ok && !t4ok && s.admUDP == admitClosed && s.admTCP == admitClosed &&
+			s.udpRefused == b.udpRefused+1 && s.udpRefusedAdm == b.udpRefusedAdm+1 &&
+			s.tcpRefused == b.tcpRefused+1 && s.tcpRefusedAdm == b.tcpRefusedAdm+1,
+		fmt.Sprintf("udp=%v tcp=%v adm=%d/%d udp_refused=%d->%d tcp_refused=%d->%d", c1ok, t4ok, s.admUDP, s.admTCP,
+			b.udpRefused, s.udpRefused, b.tcpRefused, s.tcpRefused))
+	check("G5 closed: live sessions keep working", tcpEcho(t1, "t1c") && tcpEcho(t3, "t3c"), "")
 	check("G5 probe result is reported", s.lastProbeKB == 5*1024 && probeCalls() > 0,
 		fmt.Sprintf("probe_kb=%d calls=%d", s.lastProbeKB, probeCalls()))
 
@@ -457,93 +684,74 @@ func partGuard() {
 	s = mustStats()
 	check("G5 between thresholds after closed: udp hold, tcp open", t5ok && s.admUDP == admitHold && s.admTCP == admitOpen,
 		fmt.Sprintf("tcp=%v adm=%d/%d", t5ok, s.admUDP, s.admTCP))
-	// Без живых UDP в HOLD новой сессии не на чьё место встать, хотя до потолка 16 далеко.
-	_, relieved := relieveAndWait(reliefUDP, 0, 0)
-	time.Sleep(300 * time.Millisecond)
-	s = mustStats()
-	check("G5 relieve closes all udp before the hold test", relieved && s.udpLive == 0, fmt.Sprintf("live=%d", s.udpLive))
-	refusedAdmBefore := s.udpRefusedAdm
-	h1 := r.openUDP(1, 22600)
-	h1ok := udpEcho(h1[0], "g5h")
-	s = mustStats()
-	check("G5 hold refuses udp growth below the cap", !h1ok && s.udpRefusedAdm > refusedAdmBefore,
-		fmt.Sprintf("echo=%v live=%d refused_adm=%d->%d", h1ok, s.udpLive, refusedAdmBefore, s.udpRefusedAdm))
 
 	setFakeAvailKB(13 * 1024)
 	time.Sleep(100 * time.Millisecond)
-	h2 := r.openUDP(1, 22700)
-	h2ok := udpEcho(h2[0], "g5h2")
+	b = mustStats()
+	ok = udpEcho(r.openUDP(1, 24600)[0], "g5h2")
 	s = mustStats()
-	check("G5 hysteresis keeps hold just above the hold threshold", !h2ok && s.admUDP == admitHold,
-		fmt.Sprintf("echo=%v adm_udp=%d", h2ok, s.admUDP))
+	check("G5 hysteresis keeps hold just above the hold threshold",
+		ok && s.admUDP == admitHold && s.udpLive == b.udpLive && s.udpEvicted == b.udpEvicted+1,
+		fmt.Sprintf("echo=%v adm_udp=%d live=%d->%d evicted=%d->%d", ok, s.admUDP, b.udpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
 
 	setFakeAvailKB(20 * 1024)
 	time.Sleep(100 * time.Millisecond)
-	o1 := r.openUDP(1, 22800)
-	o1ok := udpEcho(o1[0], "g5o")
+	b = mustStats()
+	ok = udpEcho(r.openUDP(1, 24700)[0], "g5o")
 	s = mustStats()
-	check("G5 plenty of memory: open again", o1ok && s.admUDP == admitOpen && s.admTCP == admitOpen,
-		fmt.Sprintf("echo=%v adm=%d/%d", o1ok, s.admUDP, s.admTCP))
+	check("G5 plenty of memory: open again, udp grows", ok && s.admUDP == admitOpen && s.admTCP == admitOpen && s.udpLive == b.udpLive+1,
+		fmt.Sprintf("echo=%v adm=%d/%d live=%d->%d", ok, s.admUDP, s.admTCP, b.udpLive, s.udpLive))
 	check("G5 probe off", probeOff() == 0 && setProbeTypes(sessUDP|sessTCP, sessUDP|sessTCP) == 0, "")
 	setFakeAvailKB(1024)
 	time.Sleep(100 * time.Millisecond)
-	o2 := r.openUDP(1, 22900)
-	check("G5 probe off ignores the probe", udpEcho(o2[0], "g5off"), "")
-	r.quit("guard")
-
-	// G6. Защита установившихся из ключей конфига (патч 0008) и повторное чтение конфига:
-	// потолок 16 из рантайма должен смениться на 2 из конфига.
-	protect := "  udp-max-sessions: 2\n  udp-evict-min-idle: 1000\n  udp-evict-protect-age: 500\n  udp-evict-protect-idle: 5000\n"
-	r = newRig(cfg(protect))
-	s = mustStats()
-	check("G6 restart applies config caps again and resets counters", s.udpCap == 2 && s.tcpCap == 0 && s.udpCreated == 0,
-		fmt.Sprintf("udp_cap=%d tcp_cap=%d created=%d", s.udpCap, s.tcpCap, s.udpCreated))
-	pair := r.openUDP(2, 23000)
-	check("G6 2 flows echo", allEcho(pair, "g6"), "")
-	time.Sleep(1200 * time.Millisecond)
-	p1 := r.openUDP(1, 23100)
-	p1ok := udpEcho(p1[0], "g6p")
-	s = mustStats()
-	check("G6 answered flows older than 0.5 s are not evicted after 1 s of silence", !p1ok && s.udpEvicted == 0 && s.udpRefused >= 1,
-		fmt.Sprintf("echo=%v evicted=%d refused=%d", p1ok, s.udpEvicted, s.udpRefused))
-	check("G6 protection off at runtime", setEvictProtect(sessUDP, 0, 0) == 0, "")
-	p2 := r.openUDP(1, 23200)
-	p2ok := udpEcho(p2[0], "g6q")
-	s = mustStats()
-	check("G6 without protection the silent flow is evicted", p2ok && s.udpEvicted >= 1,
-		fmt.Sprintf("echo=%v evicted=%d", p2ok, s.udpEvicted))
-	r.quit("protect")
+	check("G5 probe off ignores the probe", udpEcho(r.openUDP(1, 24800)[0], "g5off"), "")
+	r.quit("probe")
 }
 
-// Проверки правок по ревью патчей: H3 разбор ключей, K5 пороги колбэка, H4 причина отказа в HOLD,
-// H5 и K6 свежесть оценки памяти в статистике.
-func partReview() {
-	bad := "  udp-max-sessions: 64abc\n  tcp-max-sessions: -1\n"
-	r := newRig(cfg(bad))
-	s := mustStats()
-	check("H3 malformed caps fall back to no cap", s.udpCap == 0 && s.tcpCap == 0,
-		fmt.Sprintf("udp_cap=%d tcp_cap=%d", s.udpCap, s.tcpCap))
-	r.quit("bad-config")
+// G8. HOLD с защитой: защищённые UDP держат не больше половины живых UDP, новые потоки входят
+// без отказа, TCP не трогается.
+func partProbeProtect() {
+	r := newRig(cfg("  max-session-count: 16\n  evict-protect-idle: 4000\n"))
+	talkers := r.openUDP(4, 24900)
+	t1 := r.dialTCP()
+	check("G8 4 udp and 1 tcp echo", allEcho(talkers, "g8") && t1 != nil && tcpEcho(t1, "g8t"), "")
+	time.Sleep(2500 * time.Millisecond)
+	check("G8 4 udp still talk 2.5 s after they started", allEcho(talkers, "g8b"), "")
+	check("G8 probe types hold=udp close=all", setProbeTypes(sessUDP, sessUDP|sessTCP) == 0, "")
+	setFakeAvailKB(11 * 1024)
+	check("G8 probe on, hold", probeOn(0, 12*1024, 8*1024, 0, 1000, 0) == 0, "")
+	time.Sleep(100 * time.Millisecond)
 
+	b := mustStats()
+	ok := true
+	for i, c := range r.openUDP(4, 25000) {
+		ok = udpEcho(c, fmt.Sprintf("g8n-%d", i)) && ok
+	}
+	s := mustStats()
+	check("G8 hold with protected flows: new udp get in, udp does not grow, nothing refused",
+		ok && s.admUDP == admitHold && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+4 && s.udpRefused == b.udpRefused,
+		fmt.Sprintf("echo=%v adm=%d live=%d evicted=%d->%d refused=%d->%d", ok, s.admUDP, s.udpLive,
+			b.udpEvicted, s.udpEvicted, b.udpRefused, s.udpRefused))
+	check("G8 protected udp are evicted down to half of the live udp and no further",
+		stillLive(talkers[2], "g8k2") && stillLive(talkers[3], "g8k3"), "")
+	check("G8 hold does not evict tcp", s.tcpLive == 1 && s.tcpEvicted == 0 && tcpEcho(t1, "g8t2"),
+		fmt.Sprintf("tcp_live=%d tcp_evicted=%d", s.tcpLive, s.tcpEvicted))
+	check("G8 probe off", probeOff() == 0 && setProbeTypes(sessUDP|sessTCP, sessUDP|sessTCP) == 0, "")
+	r.quit("probe-protect")
+}
+
+// Проверки правок по ревью патчей: K5 пороги колбэка, H5 и K6 свежесть оценки памяти в статистике.
+func partReview() {
 	check("K5 close above hold is rejected", probeOn(0, 8*1024, 12*1024, 0, 0, 0) == -1, "")
 	check("K5 negative hysteresis is rejected", probeOn(0, 12*1024, 8*1024, -1, 0, 0) == -1, "")
 
-	caps := "  udp-max-sessions: 2\n  udp-evict-min-idle: 60000\n"
-	r = newRig(cfg(caps))
-	pair := r.openUDP(2, 24000)
-	check("H4 2 flows echo at the cap", allEcho(pair, "h4"), "")
+	r := newRig(cfg(""))
 	setFakeAvailKB(10 * 1024)
-	check("H4 probe on, hold", probeOn(0, 12*1024, 8*1024, 0, 0, 0) == 0, "")
+	check("H5 probe on", probeOn(0, 12*1024, 8*1024, 0, 0, 0) == 0, "")
 	time.Sleep(100 * time.Millisecond)
-	before := mustStats()
-	extra := r.openUDP(1, 24100)
-	eok := udpEcho(extra[0], "h4x")
-	s = mustStats()
-	check("H4 refusal at the cap in hold is not counted as memory",
-		!eok && s.admUDP == admitHold && s.udpRefused > before.udpRefused && s.udpRefusedAdm == before.udpRefusedAdm,
-		fmt.Sprintf("echo=%v adm=%d refused=%d->%d refused_adm=%d->%d", eok, s.admUDP,
-			before.udpRefused, s.udpRefused, before.udpRefusedAdm, s.udpRefusedAdm))
-
+	ok := udpEcho(r.openUDP(1, 24900)[0], "h5")
+	s := mustStats()
+	check("H5 hold admits the first udp flow", ok && s.admUDP == admitHold, fmt.Sprintf("echo=%v adm=%d", ok, s.admUDP))
 	setFakeAvailKB(20 * 1024)
 	time.Sleep(600 * time.Millisecond)
 	s = mustStats()
@@ -563,17 +771,15 @@ func partReview() {
 		fmt.Sprintf("probe_kb=%d hold_ms=%d", s.lastProbeKB, s.probeHoldMs))
 	check("K6 probe off", probeOff() == 0, "")
 	r.quit("probe-reset")
-	_, ok := stats()
+	_, ok = stats()
 	check("W4 stats are unavailable once the tunnel has stopped", !ok, "")
 }
 
-func strp(s string) *string { return &s }
-
-// D. Пул DNS (0009): UDP на 53 к адресам из списка идёт в свой пул мимо потолка UDP и колбэка памяти.
+// D. Пул DNS (0009): UDP на 53 к адресам из списка идёт в свой пул мимо таблицы max-session-count
+// и колбэка памяти.
 func partDNS() {
-	// Потолок UDP 4, а молчащий поток вытесняется только после 60 с тишины: новый обычный UDP получает отказ.
-	// Таймаут пула 4 с: шаги D1-D3 укладываются в 2 с, D4 ждёт его истечения.
-	conf := "  udp-max-sessions: 4\n  udp-evict-min-idle: 60000\n" +
+	// Таблица на 4. Таймаут пула 4 с: шаги D1-D3 укладываются в 2 с, D4 ждёт его истечения.
+	conf := "  max-session-count: 4\n" +
 		"  dns-priority-sessions: 2\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9,8.8.8.8'\n"
 	r := newRig(cfg(conf))
 	ret, size, untouched := statsCallerWithSize(statsGuardSize())
@@ -583,53 +789,53 @@ func partDNS() {
 
 	s := mustStats()
 	check("D1 pool comes from config", s.dnsCap == 2 && s.dnsLive == 0, fmt.Sprintf("dns_cap=%d dns_live=%d", s.dnsCap, s.dnsLive))
-	fill := r.openUDP(4, 24000)
-	check("D1 4 udp flows fill the cap", allEcho(fill, "d1"), "")
-	time.Sleep(300 * time.Millisecond)
-	extra := r.openUDP(1, 24100)
-	eok := udpEchoWithin(extra[0], "d1x", refusedWait)
+	fill := r.openUDP(4, 25000)
+	check("D1 4 udp flows fill the table", allEcho(fill, "d1"), "")
+	b := mustStats()
+	eok := udpEcho(r.openUDP(1, 25100)[0], "d1x")
 	s = mustStats()
-	check("D1 control: a new udp flow over a cap of silent flows is refused", !eok && s.udpLive == 4 && s.udpRefused >= 1,
-		fmt.Sprintf("echo=%v live=%d refused=%d", eok, s.udpLive, s.udpRefused))
+	check("D1 control: a new udp flow on a full table evicts one", eok && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+1,
+		fmt.Sprintf("echo=%v live=%d evicted=%d->%d", eok, s.udpLive, b.udpEvicted, s.udpEvicted))
+	b = s
 	q1 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 	q1ok := udpEcho(q1, "d1q")
 	s = mustStats()
-	check("D1 dns to a listed resolver passes the full udp cap and does not count in it",
-		q1ok && s.dnsLive == 1 && s.dnsCreated == 1 && s.udpLive == 4,
-		fmt.Sprintf("echo=%v dns_live=%d dns_created=%d udp_live=%d", q1ok, s.dnsLive, s.dnsCreated, s.udpLive))
-	refused := s.udpRefused
+	check("D1 dns to a listed resolver passes the full table, does not count in it and evicts nothing",
+		q1ok && s.dnsLive == 1 && s.dnsCreated == 1 && s.udpLive == 4 && s.udpEvicted == b.udpEvicted,
+		fmt.Sprintf("echo=%v dns_live=%d dns_created=%d udp_live=%d evicted=%d->%d", q1ok, s.dnsLive, s.dnsCreated, s.udpLive, b.udpEvicted, s.udpEvicted))
+	b = s
 	u1 := r.openUDPTo([4]byte{1, 1, 1, 1}, 53)
-	u1ok := udpEchoWithin(u1, "d1u", refusedWait)
+	u1ok := udpEcho(u1, "d1u")
 	s = mustStats()
-	check("D1 port 53 of an unlisted address is ordinary udp and is refused at the cap",
-		!u1ok && s.udpRefused > refused && s.dnsCreated == 1,
-		fmt.Sprintf("echo=%v udp_refused=%d->%d dns_created=%d", u1ok, refused, s.udpRefused, s.dnsCreated))
+	check("D1 port 53 of an unlisted address is ordinary udp and takes a place in the table",
+		u1ok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 4 && s.dnsCreated == 1,
+		fmt.Sprintf("echo=%v evicted=%d->%d udp_live=%d dns_created=%d", u1ok, b.udpEvicted, s.udpEvicted, s.udpLive, s.dnsCreated))
 
 	// D2. Колбэк памяти, пороги 12 / 8 МБ: 11 МБ - HOLD для UDP, 5 МБ - CLOSED.
 	setFakeAvailKB(11 * 1024)
 	check("D2 probe on, hold=udp close=all, 11 MB left",
 		setProbeTypes(sessUDP, sessUDP|sessTCP) == 0 && probeOn(0, 12*1024, 8*1024, 2*1024, 1000, 0) == 0, "")
 	time.Sleep(100 * time.Millisecond)
-	// Живых UDP ровно потолок, поэтому отказ считается отказом потолка, а не памяти (H4).
-	refusedBefore, refusedAdm := s.udpRefused, s.udpRefusedAdm
-	h1 := r.openUDP(1, 24200)
-	h1ok := udpEchoWithin(h1[0], "d2h", refusedWait)
+	b = mustStats()
+	h1ok := udpEcho(r.openUDP(1, 25200)[0], "d2h")
 	s = mustStats()
-	check("D2 control: hold refuses a new udp flow at the cap as a cap refusal",
-		!h1ok && s.admUDP == admitHold && s.udpRefused > refusedBefore && s.udpRefusedAdm == refusedAdm,
-		fmt.Sprintf("echo=%v adm_udp=%d refused=%d->%d refused_adm=%d->%d", h1ok, s.admUDP, refusedBefore, s.udpRefused, refusedAdm, s.udpRefusedAdm))
+	check("D2 control: hold lets a new udp flow in only in place of another",
+		h1ok && s.admUDP == admitHold && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+1 && s.udpRefused == b.udpRefused,
+		fmt.Sprintf("echo=%v adm_udp=%d live=%d evicted=%d->%d refused=%d->%d", h1ok, s.admUDP, s.udpLive, b.udpEvicted, s.udpEvicted, b.udpRefused, s.udpRefused))
+	b = s
 	q2 := r.openUDPTo([4]byte{8, 8, 8, 8}, 53)
 	q2ok := udpEcho(q2, "d2q")
 	s = mustStats()
-	check("D2 dns to a listed resolver passes in hold", q2ok && s.dnsLive == 2 && s.dnsCreated == 2,
-		fmt.Sprintf("echo=%v dns_live=%d dns_created=%d", q2ok, s.dnsLive, s.dnsCreated))
+	check("D2 dns to a listed resolver passes in hold and evicts no udp",
+		q2ok && s.dnsLive == 2 && s.dnsCreated == 2 && s.udpEvicted == b.udpEvicted,
+		fmt.Sprintf("echo=%v dns_live=%d dns_created=%d evicted=%d->%d", q2ok, s.dnsLive, s.dnsCreated, b.udpEvicted, s.udpEvicted))
 	setFakeAvailKB(5 * 1024)
 	time.Sleep(100 * time.Millisecond)
-	c1 := r.openUDP(1, 24300)
-	c1ok := udpEchoWithin(c1[0], "d2c", refusedWait)
+	b = mustStats()
+	c1ok := udpEchoWithin(r.openUDP(1, 25300)[0], "d2c", refusedWait)
 	s = mustStats()
-	check("D2 control: closed refuses a new udp flow", !c1ok && s.admUDP == admitClosed,
-		fmt.Sprintf("echo=%v adm_udp=%d", c1ok, s.admUDP))
+	check("D2 control: closed refuses a new udp flow", !c1ok && s.admUDP == admitClosed && s.udpRefused == b.udpRefused+1,
+		fmt.Sprintf("echo=%v adm_udp=%d refused=%d->%d", c1ok, s.admUDP, b.udpRefused, s.udpRefused))
 	q3 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 	q3ok := udpEcho(q3, "d2q3")
 	s = mustStats()
@@ -638,7 +844,7 @@ func partDNS() {
 		fmt.Sprintf("echo=%v dns_live=%d created=%d evicted=%d", q3ok, s.dnsLive, s.dnsCreated, s.dnsEvicted))
 
 	// D3. Три запроса разом после секунды тишины: первые два вытесняют отвеченные, третий застаёт
-	// пул из двух молодых без ответа и идёт обычным путём, а там потолок UDP полон.
+	// пул из двух молодых без ответа и идёт обычным путём, а там CLOSED.
 	time.Sleep(1200 * time.Millisecond)
 	before := s
 	burst := []*gonet.UDPConn{
@@ -647,8 +853,9 @@ func partDNS() {
 	got := burstEcho(burst, "d3")
 	s = mustStats()
 	check("D3 a pool full of young unanswered queries does not take the next one",
-		got == 2 && s.dnsRefused == before.dnsRefused+1 && s.dnsEvicted == before.dnsEvicted+2,
-		fmt.Sprintf("echo=%d/3 refused=%d->%d evicted=%d->%d", got, before.dnsRefused, s.dnsRefused, before.dnsEvicted, s.dnsEvicted))
+		got == 2 && s.dnsRefused == before.dnsRefused+1 && s.dnsEvicted == before.dnsEvicted+2 && s.udpRefused == before.udpRefused+1,
+		fmt.Sprintf("echo=%d/3 refused=%d->%d evicted=%d->%d udp_refused=%d->%d", got, before.dnsRefused, s.dnsRefused,
+			before.dnsEvicted, s.dnsEvicted, before.udpRefused, s.udpRefused))
 
 	// D4. У сессий пула свой таймаут 4 с, обычные UDP живут по read-write-timeout 30 с.
 	time.Sleep(5 * time.Second)
@@ -656,36 +863,22 @@ func partDNS() {
 	check("D4 pool sessions time out after dns-priority-timeout, ordinary udp stays", s.dnsLive == 0 && s.udpLive == 4,
 		fmt.Sprintf("dns_live=%d udp_live=%d", s.dnsLive, s.udpLive))
 	check("D4 probe off", probeOff() == 0 && setProbeTypes(sessUDP|sessTCP, sessUDP|sessTCP) == 0, "")
-
-	// D5. Сеттер: пул 1 на 1.1.1.1, список с IPv6 отклоняется целиком.
-	check("D5 set_dns_priority(1, default timeout, 1.1.1.1)", setDnsPriority(1, 0, strp("1.1.1.1")) == 0, "")
-	check("D5 invalid list is rejected and changes nothing",
-		setDnsPriority(4, 0, strp("1.1.1.1,::1")) == -1 && mustStats().dnsCap == 1, "")
-	created := mustStats().dnsCreated
-	u2 := r.openUDPTo([4]byte{1, 1, 1, 1}, 53)
-	u2ok := udpEcho(u2, "d5u")
-	s = mustStats()
-	check("D5 the newly listed address goes to the pool past the full udp cap", u2ok && s.dnsCreated == created+1,
-		fmt.Sprintf("echo=%v dns_created=%d->%d", u2ok, created, s.dnsCreated))
-	refused = s.udpRefused
-	q4 := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
-	q4ok := udpEchoWithin(q4, "d5q", refusedWait)
-	s = mustStats()
-	check("D5 the address dropped from the list is ordinary udp again", !q4ok && s.udpRefused > refused,
-		fmt.Sprintf("echo=%v udp_refused=%d->%d", q4ok, refused, s.udpRefused))
 	r.quit("dns")
 }
 
 // D6. Запрос, не влезший в полный пул молодых без ответа (0011), идёт обычным путём UDP: при открытом
-// приёме стартует обычной сессией, в HOLD и CLOSED колбэка получает отказ, как любой новый UDP.
+// приёме стартует обычной сессией, в HOLD встаёт на место живой UDP, в CLOSED получает отказ.
 func partDNSOverflow() {
-	// Потолок UDP 8 с запасом, пул 2 на 9.9.9.9: четыре запроса разом - два в пул, два мимо него.
-	conf := "  udp-max-sessions: 8\n  udp-evict-min-idle: 60000\n" +
+	// Таблица на 8 с запасом, пул 2 на 9.9.9.9: четыре запроса разом - два в пул, два мимо него.
+	conf := "  max-session-count: 8\n" +
 		"  dns-priority-sessions: 2\n  dns-priority-timeout: 4000\n  dns-priority-addresses: '9.9.9.9'\n"
 	r := newRig(cfg(conf))
 	ret, size, untouched := statsCallerWithSize(statsPoolSize())
 	check("D6 stats accept the size of a caller without dns_overflow and write nothing past it",
 		ret == 0 && size == statsPoolSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
+	ret, size, untouched = statsCallerWithSize(statsBudgetSize())
+	check("S1 stats accept the size of a caller without the memory budget fields and write nothing past it",
+		ret == 0 && size == statsBudgetSize() && untouched, fmt.Sprintf("ret=%d size=%d untouched=%v", ret, size, untouched))
 
 	burst := func(tag string) (int, sessionStats, sessionStats) {
 		// Пауза разводит пачки: ответы и отказы предыдущей уже дошли.
@@ -709,19 +902,21 @@ func partDNSOverflow() {
 		setProbeTypes(sessUDP, sessUDP|sessTCP) == 0 && probeOn(0, 12*1024, 8*1024, 2*1024, 1000, 0) == 0, "")
 	time.Sleep(100 * time.Millisecond)
 	got, b, s = burst("d6h")
-	check("D6 hold: queries over a full pool are refused like new udp",
-		got == 2 && s.admUDP == admitHold && s.dnsRefused == b.dnsRefused+2 && s.dnsOverflow == b.dnsOverflow &&
-			s.udpRefusedAdm == b.udpRefusedAdm+2,
-		fmt.Sprintf("echo=%d/4 adm_udp=%d dns_refused=%d->%d dns_overflow=%d->%d refused_adm=%d->%d",
-			got, s.admUDP, b.dnsRefused, s.dnsRefused, b.dnsOverflow, s.dnsOverflow, b.udpRefusedAdm, s.udpRefusedAdm))
+	check("D6 hold: queries over a full pool take the place of live udp sessions",
+		got == 4 && s.admUDP == admitHold && s.dnsRefused == b.dnsRefused+2 && s.dnsOverflow == b.dnsOverflow+2 &&
+			s.udpLive == b.udpLive && s.udpEvicted == b.udpEvicted+2 && s.udpRefusedAdm == b.udpRefusedAdm,
+		fmt.Sprintf("echo=%d/4 adm_udp=%d dns_refused=%d->%d dns_overflow=%d->%d udp_live=%d->%d evicted=%d->%d refused_adm=%d->%d",
+			got, s.admUDP, b.dnsRefused, s.dnsRefused, b.dnsOverflow, s.dnsOverflow, b.udpLive, s.udpLive,
+			b.udpEvicted, s.udpEvicted, b.udpRefusedAdm, s.udpRefusedAdm))
 
 	setFakeAvailKB(5 * 1024)
 	time.Sleep(100 * time.Millisecond)
 	got, b, s = burst("d6c")
 	check("D6 closed: queries over a full pool are refused like new udp",
-		got == 2 && s.admUDP == admitClosed && s.dnsRefused == b.dnsRefused+2 && s.dnsOverflow == b.dnsOverflow,
-		fmt.Sprintf("echo=%d/4 adm_udp=%d dns_refused=%d->%d dns_overflow=%d->%d",
-			got, s.admUDP, b.dnsRefused, s.dnsRefused, b.dnsOverflow, s.dnsOverflow))
+		got == 2 && s.admUDP == admitClosed && s.dnsRefused == b.dnsRefused+2 && s.dnsOverflow == b.dnsOverflow &&
+			s.udpRefusedAdm == b.udpRefusedAdm+2,
+		fmt.Sprintf("echo=%d/4 adm_udp=%d dns_refused=%d->%d dns_overflow=%d->%d refused_adm=%d->%d",
+			got, s.admUDP, b.dnsRefused, s.dnsRefused, b.dnsOverflow, s.dnsOverflow, b.udpRefusedAdm, s.udpRefusedAdm))
 
 	setFakeAvailKB(20 * 1024)
 	time.Sleep(100 * time.Millisecond)
@@ -734,27 +929,26 @@ func partDNSOverflow() {
 }
 
 // O. Запрос сверх пула, ставший обычной сессией UDP, живёт по таймауту пула (O1) и не попадает под
-// защиту установившихся (O2). Потолок UDP и колбэк памяти к нему применяются как раньше (D6).
+// защиту evict-protect-idle (O2). max-session-count и колбэк памяти к нему применяются как раньше (D6).
 func partDNSOverflowSession() {
-	// Пул 1 на 9.9.9.9 с таймаутом 2 с, read-write-timeout обычного UDP 30 с. Потолок UDP 2,
-	// ответившие потоки старше 0.1 с защищены от вытеснения минуту.
-	conf := "  udp-max-sessions: 2\n  udp-evict-min-idle: 500\n" +
-		"  udp-evict-protect-age: 100\n  udp-evict-protect-idle: 60000\n" +
+	// Пул 1 на 9.9.9.9 с таймаутом 2 с, read-write-timeout обычного UDP 30 с. Таблица на 2, защищён
+	// поток, говоривший через 1 с после создания и молчащий меньше 2 с.
+	conf := "  max-session-count: 2\n  evict-protect-idle: 2000\n" +
 		"  dns-priority-sessions: 1\n  dns-priority-timeout: 2000\n  dns-priority-addresses: '9.9.9.9'\n"
 	var r *rig
 	// Пул занят молодым запросом без ответа, следующий запрос идёт мимо пула.
-	overflow := func(tag string) (bool, sessionStats, sessionStats) {
+	overflow := func(tag string) (*gonet.UDPConn, bool, sessionStats, sessionStats) {
 		hold := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 		hold.Write([]byte("NOREPLY-" + tag))
 		time.Sleep(50 * time.Millisecond)
 		before := mustStats()
 		ov := r.openUDPTo([4]byte{9, 9, 9, 9}, 53)
 		ok := udpEcho(ov, tag)
-		return ok, before, mustStats()
+		return ov, ok, before, mustStats()
 	}
 
 	r = newRig(cfg(conf))
-	ok, b, s := overflow("o1")
+	_, ok, b, s := overflow("o1")
 	check("O1 a query over a full pool starts as an ordinary udp session",
 		ok && s.dnsOverflow == b.dnsOverflow+1 && s.udpLive == b.udpLive+1,
 		fmt.Sprintf("echo=%v overflow=%d->%d udp_live=%d->%d", ok, b.dnsOverflow, s.dnsOverflow, b.udpLive, s.udpLive))
@@ -765,21 +959,22 @@ func partDNSOverflowSession() {
 	r.quit("dns-overflow-timeout")
 
 	r = newRig(cfg(conf))
-	ok, _, _ = overflow("o2")
-	plain := r.openUDP(1, 25000)
-	pok := udpEcho(plain[0], "o2p")
+	plain := r.openUDP(1, 25400)[0]
+	pok := udpEcho(plain, "o2p")
+	ov, ok, _, _ := overflow("o2")
 	s = mustStats()
-	check("O2 the overflow session and an ordinary flow fill the udp cap",
-		ok && pok && s.udpLive == 2, fmt.Sprintf("echo=%v/%v udp_live=%d", ok, pok, s.udpLive))
-	// Оба ответили и молчат дольше udp-evict-min-idle: обычный поток защищён, переполнение - нет.
-	time.Sleep(700 * time.Millisecond)
+	check("O2 an ordinary flow and the overflow session fill the table",
+		ok && pok && s.udpLive == 2, fmt.Sprintf("echo=%v/%v udp_live=%d", pok, ok, s.udpLive))
+	// Оба говорят через 1.4 с после создания, переполнение последним: давнее активен обычный поток.
+	time.Sleep(1400 * time.Millisecond)
+	pok = udpEcho(plain, "o2p2")
+	ok = udpEcho(ov, "o2v2")
 	b = mustStats()
-	next := r.openUDP(1, 25100)
-	nok := udpEcho(next[0], "o2n")
+	nok := udpEcho(r.openUDP(1, 25500)[0], "o2n")
 	s = mustStats()
-	check("O2 a new flow takes the place of the silent overflow session, the protected flow stays",
-		nok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 2 && udpEcho(plain[0], "o2p2"),
-		fmt.Sprintf("echo=%v evicted=%d->%d udp_live=%d", nok, b.udpEvicted, s.udpEvicted, s.udpLive))
+	check("O2 a new flow takes the place of the overflow session, the protected flow stays although less recently active",
+		pok && ok && nok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 2 && s.protectedLive == 1 && stillLive(plain, "o2p3"),
+		fmt.Sprintf("echo=%v/%v/%v evicted=%d->%d udp_live=%d protected=%d", pok, ok, nok, b.udpEvicted, s.udpEvicted, s.udpLive, s.protectedLive))
 	r.quit("dns-overflow-protect")
 }
 
@@ -819,28 +1014,42 @@ func partDNSReview() {
 		q3ok && s2.dnsEvicted == s.dnsEvicted+1 && s2.dnsOverflow == s.dnsOverflow,
 		fmt.Sprintf("echo=%v evicted=%d->%d overflow=%d->%d", q3ok, s.dnsEvicted, s2.dnsEvicted, s.dnsOverflow, s2.dnsOverflow))
 	check("F5 relieve rejects unknown session kinds", relieve(reliefUDP|4, 0, 0) == -1, "")
-	check("F8 pool size over 32 is rejected", setDnsPriority(64, 0, nil) == -1, "")
-	check("F8 pool timeout below a second is rejected", setDnsPriority(1, 500, nil) == -1, "")
-	check("F2 empty list is rejected by the setter", setDnsPriority(1, 0, strp("")) == -1, "")
-	check("F2 any is accepted", setDnsPriority(1, 0, strp("any")) == 0, "")
 	r.quit("dns-review")
 
-	r = newRig(cfg("  dns-priority-sessions: 2\n  dns-priority-addresses: ''\n"))
+	r = newRig(cfg("  dns-priority-sessions: 1\n  dns-priority-addresses: 'any'\n"))
 	s = mustStats()
-	check("F2 empty address list in config turns the pool off", s.dnsCap == 0, fmt.Sprintf("dns_cap=%d", s.dnsCap))
-	r.quit("dns-empty")
+	aok := udpEcho(r.openUDPTo([4]byte{1, 2, 3, 4}, 53), "f2any")
+	s2 = mustStats()
+	check("F2 any in config sends port 53 of any address to the pool",
+		aok && s.dnsCap == 1 && s2.dnsCreated == 1 && s2.udpCreated == 0,
+		fmt.Sprintf("echo=%v dns_cap=%d dns_created=%d udp_created=%d", aok, s.dnsCap, s2.dnsCreated, s2.udpCreated))
+	r.quit("dns-any")
 
-	r = newRig(cfg("  dns-priority-sessions: 64\n  dns-priority-addresses: '9.9.9.9'\n"))
-	s = mustStats()
-	check("F8 oversized pool in config turns the pool off", s.dnsCap == 0, fmt.Sprintf("dns_cap=%d", s.dnsCap))
-	r.quit("dns-oversized")
+	for _, c := range []struct{ name, conf string }{
+		{"F2 empty address list in config turns the pool off", "  dns-priority-sessions: 2\n  dns-priority-addresses: ''\n"},
+		{"F2 an ipv6 address in the list turns the pool off", "  dns-priority-sessions: 2\n  dns-priority-addresses: '1.1.1.1,::1'\n"},
+		{"F8 oversized pool in config turns the pool off", "  dns-priority-sessions: 64\n  dns-priority-addresses: '9.9.9.9'\n"},
+		{"F8 pool timeout below a second in config turns the pool off",
+			"  dns-priority-sessions: 1\n  dns-priority-timeout: 500\n  dns-priority-addresses: '9.9.9.9'\n"},
+	} {
+		r = newRig(cfg(c.conf))
+		s = mustStats()
+		check(c.name, s.dnsCap == 0, fmt.Sprintf("dns_cap=%d", s.dnsCap))
+		r.quit("dns-off")
+	}
 }
 
 func main() {
 	flag.Parse()
 	os.Remove(*logPath)
 	partR8()
-	partGuard()
+	partTable()
+	partProtect()
+	partProtectHalf()
+	partProtectShared()
+	partYoung()
+	partProbe()
+	partProbeProtect()
 	partReview()
 	partDNS()
 	partDNSOverflow()
