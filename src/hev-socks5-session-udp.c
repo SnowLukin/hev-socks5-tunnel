@@ -68,9 +68,10 @@ hev_socks5_session_udp_reset_queue_stats (void)
 }
 
 /*
- * A session of the DNS pool is outside the buffer budget: a lookup must not
- * be dropped because TCP windows have used it up. A query takes a datagram
- * or two, its small queue and the pool size bound what the pool holds.
+ * A session of the DNS pool is outside the buffer budget, neither dropped by
+ * it nor charged to it: a lookup must not be dropped because TCP windows have
+ * used it up, nor make others drop. A query takes a datagram or two, its
+ * small queue and the pool size bound what the pool holds.
  */
 static int
 udp_pool_session (HevSocks5SessionUDP *self)
@@ -136,7 +137,7 @@ udp_frame_charge (struct pbuf *p)
 static void
 udp_frame_free (HevSocks5SessionUDP *self, HevSocks5UDPFrame *frame)
 {
-    if (hev_socks5_tunnel_buffer_limit)
+    if (hev_socks5_tunnel_buffer_limit && !udp_pool_session (self))
         hev_socks5_tunnel_buffer_charge (&self->data,
                                          -udp_frame_charge (frame->data));
     pbuf_free (frame->data);
@@ -399,7 +400,7 @@ udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
     self->data.pending++;
     queued_total_add (1);
     hev_list_add_tail (&self->frame_list, &frame->node);
-    if (hev_socks5_tunnel_buffer_limit)
+    if (hev_socks5_tunnel_buffer_limit && !udp_pool_session (self))
         hev_socks5_tunnel_buffer_charge (&self->data, udp_frame_charge (p));
     hev_task_wakeup (self->data.task);
 }

@@ -756,8 +756,8 @@ hev_socks5_tunnel_update_session (HevListNode *node)
  *    budget, at least a fair share of it, and never less than what lwIP needs
  *    to announce a closed window again. A session that holds more than it is
  *    granted does not get its window reopened as far, until it is under.
- *  - UDP: datagrams are dropped while the budget is used up, except for the
- *    DNS pool, whose small queues are charged but never dropped for it.
+ *  - UDP: datagrams are dropped while the budget is used up. The DNS pool is
+ *    outside of it, its small queues are neither charged nor dropped.
  *
  * Only the window floors can overcommit it, by up to a floor for each session
  * that is receiving at once. Then the sessions that hold packets without any
