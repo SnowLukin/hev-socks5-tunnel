@@ -1,10 +1,11 @@
 // Смоук hev кита (срез macosx arm64): gVisor netstack <-> socketpair (формат utun) <-> hev <-> socksd.
 // Часть 1 - проверки r8: relieve, гонка relieve с остановкой.
 // Часть 2 - бюджет сессий: G1 одна таблица max-session-count, у потолка новая сессия вытесняет давнее
-// всех активную и не получает отказ; G2 TCP в той же таблице; G3 защита evict-protect-idle и её конец;
-// G4 защищённые держат не больше половины таблицы; G7 молодой поток с ответом держится 2 с; G5 колбэк
-// памяти (HOLD вытесняет сессию своего типа вместо отказа, CLOSED отказывает, гистерезис, типы
-// колбэка); G6 повторное чтение конфига на перезапуске; K5, H5, K6, W4 правки по ревью колбэка.
+// всех активную и не получает отказ; G2 TCP в той же таблице, сессию отдаёт тип с половиной таблицы и
+// больше; G3 защита evict-protect-idle и её конец; G4 защищённые держат не больше половины таблицы; G7
+// молодой поток с ответом держится 2 с; G5 колбэк памяти (HOLD вытесняет сессию своего типа вместо
+// отказа, CLOSED отказывает, гистерезис, типы колбэка); G6 повторное чтение конфига на перезапуске;
+// K5, H5, K6, W4 правки по ревью колбэка.
 // Часть 3 - пул DNS (0009, 0011): D - пул мимо полной таблицы, HOLD и CLOSED, адреса из списка и мимо
 // него, вытеснение и отказ в полном пуле, свой таймаут, старый размер статистики; D6 - запрос сверх
 // полного пула идёт обычным путём UDP; O - такой запрос живёт по таймауту пула и без защиты; F -
@@ -403,7 +404,7 @@ func noReply(cs []*gonet.UDPConn, tag string) {
 }
 
 // G1, G2. Одна таблица UDP и TCP на max-session-count 4: новый поток у потолка вытесняет давнее
-// всех активный и никогда не получает отказ.
+// всех активный из типов, что держат половину таблицы и больше, и никогда не получает отказ.
 func partTable() {
 	check("stats refuse a too small size", statsWithSize(8) == -1, "")
 	r := newRig(cfg("  max-session-count: 4\n  max-buffer-size: 1048576\n"))
@@ -429,29 +430,49 @@ func partTable() {
 		ok && s.udpEvicted == b.udpEvicted+1 && s.udpLive == 4,
 		fmt.Sprintf("echo=%v evicted=%d->%d live=%d", ok, b.udpEvicted, s.udpEvicted, s.udpLive))
 
-	// G2. TCP в той же таблице: соединение вытесняет UDP, а давнее всех активное TCP вытесняется само.
-	b = mustStats()
-	t1 := r.dialTCP()
-	ok = t1 != nil && tcpEcho(t1, "t1")
-	s = mustStats()
-	check("G2 tcp at the cap takes the place of the least recently active udp",
-		ok && s.tcpLive == 1 && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+1,
-		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d evicted=%d->%d", ok, s.tcpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
-	check("G2 the remaining udp flows echo", udpEcho(extra[0], "g2a") && udpEcho(extra[1], "g2b") && udpEcho(first[0], "g2c"), "")
-	n := r.openUDP(1, 22200)
-	ok = udpEcho(n[0], "g2n")
-	t1ok := tcpEcho(t1, "t1b")
-	s = mustStats()
-	check("G2 a least recently active tcp connection is evicted and reset",
-		ok && !t1ok && s.tcpEvicted == 1 && s.tcpLive == 0 && s.udpLive == 4,
-		fmt.Sprintf("echo=%v tcp=%v tcp_evicted=%d tcp_live=%d udp_live=%d", ok, t1ok, s.tcpEvicted, s.tcpLive, s.udpLive))
-
 	b = mustStats()
 	got := burstEcho(r.openUDP(4, 22300), "g1b")
 	s = mustStats()
 	check("G1 a burst of 4 new flows on a full table replaces the 4 old ones, none refused",
 		got == 4 && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+4 && s.udpRefused == 0,
 		fmt.Sprintf("echo=%d/4 live=%d evicted=%d->%d refused=%d", got, s.udpLive, b.udpEvicted, s.udpEvicted, s.udpRefused))
+
+	// G2. TCP в той же таблице. Сессию у потолка отдаёт только тип, который держит половину таблицы и
+	// больше: шторм одного типа не забирает у другого его половину.
+	b = mustStats()
+	t1 := r.dialTCP()
+	ok = t1 != nil && tcpEcho(t1, "t1")
+	s = mustStats()
+	check("G2 tcp under half of the table takes the place of the least recently active udp",
+		ok && s.tcpLive == 1 && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+1 && s.tcpEvicted == 0,
+		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d evicted=%d->%d", ok, s.tcpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
+	b = mustStats()
+	n := r.openUDP(1, 22200)
+	ok = udpEcho(n[0], "g2n")
+	t1ok := tcpEcho(t1, "t1b")
+	s = mustStats()
+	check("G2 udp over half of the table evicts its own flow, not the less recently active tcp connection",
+		ok && t1ok && s.tcpEvicted == 0 && s.tcpLive == 1 && s.udpLive == 3 && s.udpEvicted == b.udpEvicted+1,
+		fmt.Sprintf("echo=%v tcp=%v tcp_evicted=%d tcp_live=%d udp_live=%d", ok, t1ok, s.tcpEvicted, s.tcpLive, s.udpLive))
+	t2 := r.dialTCP()
+	ok = t2 != nil && tcpEcho(t2, "t2")
+	t3 := r.dialTCP()
+	ok = ok && t3 != nil && tcpEcho(t3, "t3")
+	s = mustStats()
+	check("G2 with both types at half the least recently active session of the table goes, here an udp flow",
+		ok && s.tcpLive == 3 && s.udpLive == 1 && s.tcpEvicted == 0,
+		fmt.Sprintf("echo=%v tcp_live=%d udp_live=%d tcp_evicted=%d", ok, s.tcpLive, s.udpLive, s.tcpEvicted))
+	b = mustStats()
+	t4 := r.dialTCP()
+	ok = t4 != nil && tcpEcho(t4, "t4")
+	t2ok := tcpEcho(t2, "t2b")
+	t1ok = tcpEcho(t1, "t1c")
+	s = mustStats()
+	check("G2 tcp over half evicts its own least recently active connection, the udp flow under half stays",
+		ok && !t1ok && t2ok && s.tcpEvicted == 1 && s.tcpLive == 3 && s.udpLive == 1 && s.udpEvicted == b.udpEvicted &&
+			stillLive(n[0], "g2k"),
+		fmt.Sprintf("echo=%v t1=%v t2=%v tcp_evicted=%d tcp_live=%d udp_live=%d udp_evicted=%d->%d",
+			ok, t1ok, t2ok, s.tcpEvicted, s.tcpLive, s.udpLive, b.udpEvicted, s.udpEvicted))
 	r.quit("table")
 }
 

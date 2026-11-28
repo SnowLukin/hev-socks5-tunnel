@@ -328,14 +328,15 @@ session_is_young (HevSocks5SessionData *sd, int idle, int64_t now)
 }
 
 /*
- * Evicts sessions of the type (SESSION_TYPES: either) from the table until
+ * Evicts sessions of the types (a mask of 1 << type) from the table until
  * count of them is under limit, the least recently active first. Protected
- * sessions are kept up to half of limit, young ones in what is left of that
- * half, past that they go in the same order as the others. Returns the number
- * evicted. The caller holds the lwIP mutex.
+ * sessions are kept up to keep, young ones in what is left of it, past that
+ * they go in the same order as the others. Returns the number evicted. The
+ * caller holds the lwIP mutex.
  */
 static int
-session_make_room (int type, int count, int limit, int64_t now)
+session_make_room (unsigned int types, int count, int limit, int keep,
+                   int64_t now)
 {
     int idle = hev_config_get_misc_evict_protect_idle ();
     int protected_over = 0;
@@ -347,34 +348,33 @@ session_make_room (int type, int count, int limit, int64_t now)
         return 0;
 
     if (idle) {
+        int protected_table = 0;
         int protected_count = 0;
         int young_count = 0;
-        int half = limit / 2;
 
         node = hev_list_first (&session_set);
         for (; node; node = hev_list_node_next (node)) {
             HevSocks5SessionData *sd;
 
             sd = container_of (node, HevSocks5SessionData, node);
-            if (type != SESSION_TYPES && sd->type != type)
-                continue;
-            if (session_is_protected (sd, idle, now))
-                protected_count++;
-            else if (session_is_young (sd, idle, now))
+            if (session_is_protected (sd, idle, now)) {
+                protected_table++;
+                if (types & (1 << sd->type))
+                    protected_count++;
+            } else if ((types & (1 << sd->type)) &&
+                       session_is_young (sd, idle, now)) {
                 young_count++;
+            }
         }
 
-        protected_over = protected_count - half;
+        protected_over = protected_count - keep;
         if (protected_over < 0) {
-            young_over = young_count + protected_count - half;
+            young_over = young_count + protected_count - keep;
             protected_over = 0;
         } else {
             young_over = young_count;
         }
-        /* HOLD counts one type only, the stats tell about the table. */
-        if (type == SESSION_TYPES)
-            __atomic_store_n (&stat_protected, protected_count,
-                              __ATOMIC_RELAXED);
+        __atomic_store_n (&stat_protected, protected_table, __ATOMIC_RELAXED);
     }
 
     node = hev_list_first (&session_set);
@@ -384,7 +384,7 @@ session_make_room (int type, int count, int limit, int64_t now)
 
         sd = container_of (node, HevSocks5SessionData, node);
         node = next;
-        if (type != SESSION_TYPES && sd->type != type)
+        if (!(types & (1 << sd->type)))
             continue;
         if (session_is_protected (sd, idle, now)) {
             if (protected_over <= 0)
@@ -521,13 +521,19 @@ admission_for (int type, int probe)
  * refused only while the memory probe is CLOSED for its type. In HOLD the
  * sessions of its type don't grow: it takes the place of one of them, chosen
  * as at max-session-count, so that a UDP surge does not close TCP connections.
- * The caller holds the lwIP mutex.
+ *
+ * At max-session-count only the sessions of a type that holds at least half
+ * of the table make room, so a surge of one type replaces its own sessions
+ * and the other type keeps what it holds of its half. Protected and young
+ * sessions keep half of the table: the type under half holds less than that,
+ * so there is always one to evict. The caller holds the lwIP mutex.
  */
 static int
 session_admit (int type)
 {
     int64_t now = monotonic_ms ();
-    int state, max;
+    unsigned int types = 0;
+    int state, max, count, limit, t;
 
     admit_replaced = 0;
     state = admission_for (type, probe_update (now));
@@ -539,12 +545,26 @@ session_admit (int type)
     }
 
     if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD && session_live_count[type] &&
-        session_make_room (type, session_live_count[type],
-                           session_live_count[type], now))
+        session_make_room (1 << type, session_live_count[type],
+                           session_live_count[type],
+                           session_live_count[type] / 2, now))
         admit_replaced = 1;
 
     max = hev_config_get_misc_max_session_count ();
-    if (max > 0 && session_make_room (SESSION_TYPES, session_count, max, now))
+    if (max <= 0 || session_count < max)
+        return 0;
+
+    count = 0;
+    limit = max;
+    for (t = SESSION_UDP; t <= SESSION_TCP; t++) {
+        if (session_live_count[t] * 2 >= max) {
+            types |= 1 << t;
+            count += session_live_count[t];
+        } else {
+            limit -= session_live_count[t];
+        }
+    }
+    if (session_make_room (types, count, limit, max / 2, now))
         admit_replaced = 1;
 
     return 0;

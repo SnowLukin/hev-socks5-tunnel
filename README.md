@@ -275,6 +275,9 @@ tunnel keeps running.
 
 * `max-session-count`: over it, the session that has not moved any data for
   the longest time is closed, even if it keeps receiving data it can't forward.
+  UDP and TCP share the table, and only a type that holds at least half of it
+  gives up a session: a surge of UDP flows replaces its own sessions and the
+  TCP connections keep what they hold of their half, and the other way round.
 * `evict-protect-idle`: a connection that only talks now and then, like one
   with keep-alives every few seconds, would still be the one closed while new
   connections keep coming. With it set, a session that got a reply from
