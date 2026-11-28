@@ -106,14 +106,19 @@ class BufferBudgetTest(TunnelTestCase):
     def test_concurrent_with_overcommitted_budget(self):
         # the window floors of these sessions exceed the budget
         self.tunnel(misc={"max-buffer-size": 512 * 1024})
+
+        def upload(i):
+            try:
+                return client.tcp_upload_digest(self.t4 if i % 2 else self.t6,
+                                                self.bed.P_DIGEST, 4 << 20, 60)
+            except OSError:
+                return None
+
         with cf.ThreadPoolExecutor(32) as ex:
-            futs = [ex.submit(client.tcp_upload_digest,
-                              self.t4 if i % 2 else self.t6,
-                              self.bed.P_DIGEST, 4 << 20, 60)
-                    for i in range(32)]
-            res = [f.result() for f in futs]
-        # evicted ones fail, the others must be intact
-        self.assertTrue(any(res))
+            res = list(ex.map(upload, range(32)))
+        # evicted ones are reset, the ones that finished must be intact
+        self.assertNotIn(False, res)
+        self.assertIn(True, res)
         self.assertTrue(client.tcp_echo(self.t4, self.bed.P_ECHO, 100000))
 
     def test_udp_with_small_budget(self):

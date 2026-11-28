@@ -641,6 +641,38 @@ func partProbe() {
 	r.quit("probe")
 }
 
+// G8. HOLD с защитой: защищённые UDP держат не больше половины живых UDP, новые потоки входят
+// без отказа, TCP не трогается.
+func partProbeProtect() {
+	r := newRig(cfg("  max-session-count: 16\n  evict-protect-idle: 4000\n"))
+	talkers := r.openUDP(4, 24900)
+	t1 := r.dialTCP()
+	check("G8 4 udp and 1 tcp echo", allEcho(talkers, "g8") && t1 != nil && tcpEcho(t1, "g8t"), "")
+	time.Sleep(2500 * time.Millisecond)
+	check("G8 4 udp still talk 2.5 s after they started", allEcho(talkers, "g8b"), "")
+	check("G8 probe types hold=udp close=all", setProbeTypes(sessUDP, sessUDP|sessTCP) == 0, "")
+	setFakeAvailKB(11 * 1024)
+	check("G8 probe on, hold", probeOn(0, 12*1024, 8*1024, 0, 1000, 0) == 0, "")
+	time.Sleep(100 * time.Millisecond)
+
+	b := mustStats()
+	ok := true
+	for i, c := range r.openUDP(4, 25000) {
+		ok = udpEcho(c, fmt.Sprintf("g8n-%d", i)) && ok
+	}
+	s := mustStats()
+	check("G8 hold with protected flows: new udp get in, udp does not grow, nothing refused",
+		ok && s.admUDP == admitHold && s.udpLive == 4 && s.udpEvicted == b.udpEvicted+4 && s.udpRefused == b.udpRefused,
+		fmt.Sprintf("echo=%v adm=%d live=%d evicted=%d->%d refused=%d->%d", ok, s.admUDP, s.udpLive,
+			b.udpEvicted, s.udpEvicted, b.udpRefused, s.udpRefused))
+	check("G8 protected udp are evicted down to half of the live udp and no further",
+		stillLive(talkers[2], "g8k2") && stillLive(talkers[3], "g8k3"), "")
+	check("G8 hold does not evict tcp", s.tcpLive == 1 && s.tcpEvicted == 0 && tcpEcho(t1, "g8t2"),
+		fmt.Sprintf("tcp_live=%d tcp_evicted=%d", s.tcpLive, s.tcpEvicted))
+	check("G8 probe off", probeOff() == 0 && setProbeTypes(sessUDP|sessTCP, sessUDP|sessTCP) == 0, "")
+	r.quit("probe-protect")
+}
+
 // Проверки правок по ревью патчей: K5 пороги колбэка, H5 и K6 свежесть оценки памяти в статистике.
 func partReview() {
 	check("K5 close above hold is rejected", probeOn(0, 8*1024, 12*1024, 0, 0, 0) == -1, "")
@@ -949,6 +981,7 @@ func main() {
 	partProtectHalf()
 	partYoung()
 	partProbe()
+	partProbeProtect()
 	partReview()
 	partDNS()
 	partDNSOverflow()
