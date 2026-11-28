@@ -53,6 +53,8 @@ struct _HevSocks5SessionData
     int buffered;
     /* When buffered last went from 0 to more. */
     int64_t held_time;
+    /* The socks5 handshake is done, the session relays data. */
+    int relaying;
 };
 
 struct _HevSocks5SessionIface

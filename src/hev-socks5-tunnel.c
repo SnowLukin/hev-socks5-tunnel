@@ -689,6 +689,7 @@ hev_socks5_tunnel_insert_session (HevListNode *node, int type, int lookup)
     sd->lookup = lookup;
     sd->timeout = 0;
     sd->buffered = 0;
+    sd->relaying = 0;
     if (lookup)
         sd->timeout =
             __atomic_load_n (&dns_priority_timeout_ms, __ATOMIC_RELAXED);

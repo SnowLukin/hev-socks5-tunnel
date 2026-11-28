@@ -11,6 +11,7 @@
 
 #include "hev-utils.h"
 #include "hev-logger.h"
+#include "hev-compiler.h"
 #include "hev-config.h"
 #include "hev-config-const.h"
 #include "hev-socks5-client.h"
@@ -22,6 +23,7 @@ void
 hev_socks5_session_run (HevSocks5Session *self)
 {
     HevSocks5SessionIface *iface;
+    HevSocks5SessionData *sd;
     HevConfigServer *srv;
     int res;
 
@@ -56,6 +58,8 @@ hev_socks5_session_run (HevSocks5Session *self)
     iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
     if (HEV_SOCKS5 (self)->type != HEV_SOCKS5_TYPE_TCP)
         hev_socks5_set_diagnostic_target (HEV_SOCKS5 (self), "udp-association");
+    sd = container_of (iface->get_node (self), HevSocks5SessionData, node);
+    sd->relaying = 1;
     iface->splicer (self);
 }
 
@@ -91,13 +95,21 @@ hev_socks5_session_release (HevSocks5Session *self)
 /*
  * End the session, and reset the upstream connection: what is left in its
  * buffers is dropped instead of being kept until it is sent.
+ *
+ * Not during the socks5 handshake, nothing is buffered then: the Xray socks
+ * inbound (26.9) crashes on a reset while it answers a UDP ASSOCIATE, and
+ * under a surge sessions are evicted that early.
  */
 void
 hev_socks5_session_abort (HevSocks5Session *self)
 {
+    HevSocks5SessionIface *iface;
+    HevSocks5SessionData *sd;
     int fd = HEV_SOCKS5 (self)->fd;
 
-    if (fd >= 0)
+    iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
+    sd = container_of (iface->get_node (self), HevSocks5SessionData, node);
+    if (fd >= 0 && sd->relaying)
         set_sock_abort_on_close (fd);
 
     hev_socks5_session_terminate (self);
