@@ -111,7 +111,8 @@ class BufferBudgetTest(TunnelTestCase):
             try:
                 return client.tcp_upload_digest(self.t4 if i % 2 else self.t6,
                                                 self.bed.P_DIGEST, 4 << 20, 60)
-            except OSError:
+            except ConnectionError:
+                # evicted, a hang (timeout) still fails the test
                 return None
 
         with cf.ThreadPoolExecutor(32) as ex:
