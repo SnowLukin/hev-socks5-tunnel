@@ -371,7 +371,10 @@ session_make_room (int type, int count, int limit, int64_t now)
         } else {
             young_over = young_count;
         }
-        __atomic_store_n (&stat_protected, protected_count, __ATOMIC_RELAXED);
+        /* HOLD counts one type only, the stats tell about the table. */
+        if (type == SESSION_TYPES)
+            __atomic_store_n (&stat_protected, protected_count,
+                              __ATOMIC_RELAXED);
     }
 
     node = hev_list_first (&session_set);

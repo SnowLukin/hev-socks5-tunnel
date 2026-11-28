@@ -213,7 +213,7 @@ int hev_socks5_tunnel_set_memory_probe_types (int hold_types, int close_types);
  * @buffer_reclaimed: sessions closed because they held buffers without
  *            progress while the budget was overcommitted
  * @protected_live: sessions kept by misc.evict-protect-idle the last time
- *            room was made
+ *            room was made at misc.max-session-count
  *
  * A caller built against an older, shorter struct passes the smaller size and
  * gets the fields it knows.
