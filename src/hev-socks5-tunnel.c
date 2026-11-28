@@ -330,13 +330,13 @@ session_is_young (HevSocks5SessionData *sd, int idle, int64_t now)
 /*
  * Evicts sessions of the types (a mask of 1 << type) from the table until
  * count of them is under limit, the least recently active first. Protected
- * sessions are kept up to keep, young ones in what is left of it, past that
- * they go in the same order as the others. Returns the number evicted. The
- * caller holds the lwIP mutex.
+ * sessions of the keep_types are kept up to keep, young ones in what is left
+ * of it, past that the ones of the types go in the same order as the others.
+ * Returns the number evicted. The caller holds the lwIP mutex.
  */
 static int
-session_make_room (unsigned int types, int count, int limit, int keep,
-                   int64_t now)
+session_make_room (unsigned int types, int count, int limit,
+                   unsigned int keep_types, int keep, int64_t now)
 {
     int idle = hev_config_get_misc_evict_protect_idle ();
     int protected_over = 0;
@@ -359,9 +359,9 @@ session_make_room (unsigned int types, int count, int limit, int keep,
             sd = container_of (node, HevSocks5SessionData, node);
             if (session_is_protected (sd, idle, now)) {
                 protected_table++;
-                if (types & (1 << sd->type))
+                if (keep_types & (1 << sd->type))
                     protected_count++;
-            } else if ((types & (1 << sd->type)) &&
+            } else if ((keep_types & (1 << sd->type)) &&
                        session_is_young (sd, idle, now)) {
                 young_count++;
             }
@@ -525,8 +525,8 @@ admission_for (int type, int probe)
  * At max-session-count only the sessions of a type that holds at least half
  * of the table make room, so a surge of one type replaces its own sessions
  * and the other type keeps what it holds of its half. Protected and young
- * sessions keep half of the table: the type under half holds less than that,
- * so there is always one to evict. The caller holds the lwIP mutex.
+ * sessions of the whole table keep half of it: the type under half holds less
+ * than that, so there is always one to evict. The caller holds the lwIP mutex.
  */
 static int
 session_admit (int type)
@@ -546,7 +546,7 @@ session_admit (int type)
 
     if (state == HEV_SOCKS5_TUNNEL_ADMIT_HOLD && session_live_count[type] &&
         session_make_room (1 << type, session_live_count[type],
-                           session_live_count[type],
+                           session_live_count[type], 1 << type,
                            session_live_count[type] / 2, now))
         admit_replaced = 1;
 
@@ -564,7 +564,9 @@ session_admit (int type)
             limit -= session_live_count[t];
         }
     }
-    if (session_make_room (types, count, limit, max / 2, now))
+    if (session_make_room (types, count, limit,
+                           (1 << SESSION_UDP) | (1 << SESSION_TCP), max / 2,
+                           now))
         admit_replaced = 1;
 
     return 0;
