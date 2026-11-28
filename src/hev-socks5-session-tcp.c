@@ -79,7 +79,7 @@ tcp_update_window (HevSocks5SessionTCP *self)
     if (!pcb)
         return;
 
-    queued = self->queue ? self->queue->tot_len : 0;
+    queued = self->queued;
     target = tcp_window_target (self);
 
     wnd = (target > queued) ? target - queued : 0;
@@ -134,6 +134,7 @@ tcp_queue_free (HevSocks5SessionTCP *self, size_t s)
         c += PBUF_CHARGE_OVERHEAD;
     }
     hev_socks5_tunnel_buffer_charge (&self->data, -(c + s));
+    self->queued -= s;
 
     for (; s > 0; s -= n) {
         n = (s > 0xffff) ? 0xffff : s;
@@ -286,6 +287,7 @@ tcp_recv_handler (void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             int c = p->tot_len + pbuf_clen (p) * PBUF_CHARGE_OVERHEAD;
 
             hev_socks5_tunnel_buffer_charge (&self->data, c);
+            self->queued += p->tot_len;
         }
 
         /* Don't delay the ACK, it stalls small writes with Nagle on. */
@@ -469,6 +471,7 @@ hev_socks5_session_tcp_release (HevSocks5Session *base)
         pbuf_free (self->queue);
         self->queue = NULL;
     }
+    self->queued = 0;
 
     hev_socks5_tunnel_buffer_charge (&self->data, -self->data.buffered);
     hev_socks5_tunnel_window_set (&self->window, 0);
