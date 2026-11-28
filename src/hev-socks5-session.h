@@ -51,6 +51,8 @@ struct _HevSocks5SessionData
     int timeout;
     /* Charged to the tunnel buffer budget, see hev-socks5-tunnel.c. */
     int buffered;
+    /* When buffered last went from 0 to more. */
+    int64_t held_time;
 };
 
 struct _HevSocks5SessionIface

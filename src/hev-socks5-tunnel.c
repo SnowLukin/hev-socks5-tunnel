@@ -762,6 +762,8 @@ hev_socks5_tunnel_update_session (HevListNode *node)
  * that is receiving at once. Then the sessions that hold packets without any
  * progress for BUFFER_RECLAIM_IDLE_TIME are evicted, the least recently
  * active first, the ones that make progress keep going with smaller windows.
+ * A session that was silent and just got a packet, like a keep-alive, has
+ * not held it that long and is not one of them.
  */
 void
 hev_socks5_tunnel_buffer_charge (HevSocks5SessionData *sd, int size)
@@ -769,6 +771,8 @@ hev_socks5_tunnel_buffer_charge (HevSocks5SessionData *sd, int size)
     if (size < 0 && -size > sd->buffered)
         size = -sd->buffered;
 
+    if (!sd->buffered && size > 0)
+        sd->held_time = monotonic_ms ();
     sd->buffered += size;
     /* Read by the stats from any thread. */
     __atomic_store_n (&buffer_used, buffer_used + size, __ATOMIC_RELAXED);
@@ -833,7 +837,8 @@ hev_socks5_tunnel_reclaim (void)
         /* In LRU order, the rest made progress more recently. */
         if ((now - sd->active_time) < BUFFER_RECLAIM_IDLE_TIME)
             break;
-        if (sd->buffered > 0) {
+        if (sd->buffered > 0 &&
+            (now - sd->held_time) >= BUFFER_RECLAIM_IDLE_TIME) {
             LOG_I ("%p socks5 tunnel buffer full, evict", sd->self);
             used -= sd->buffered;
             stat_inc (&stat_reclaimed);
