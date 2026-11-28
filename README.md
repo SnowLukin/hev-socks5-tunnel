@@ -303,7 +303,9 @@ The memory used is roughly at most:
 ```
 
 The kernel doubles the socket buffer size set, for receive and send; a UDP
-session has `2 * udp-recv-buffer-size` instead. For a 50 MiB limit:
+session has `2 * udp-recv-buffer-size` instead. This is the tunnel alone: a
+proxy in the same process (e.g. Xray in an iOS Network Extension) takes its
+own memory per session, then fewer sessions fit. For a 50 MiB limit:
 
 ```yaml
 misc:
